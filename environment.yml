@@ -1,0 +1,30 @@
+name: m01-navi-opt
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - pip
+  - numpy
+  - scipy
+  - pandas
+  - xarray
+  - netcdf4
+  - networkx
+  - geopandas
+  - shapely
+  - pyproj
+  - h3-py
+  - matplotlib
+  - pytest
+  - pip:
+      - copernicusmarine
+      - ortools
+      - pyomo
+      - fastapi
+      - uvicorn[standard]
+      - pydantic
+      - streamlit
+      - plotly
+      - confluent-kafka
+      - python-dotenv
+      - requests

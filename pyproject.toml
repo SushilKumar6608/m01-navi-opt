@@ -1,0 +1,16 @@
+[project]
+name = "navi-opt"
+version = "0.1.0"
+description = "M01 - NAVI-Opt: Dynamic Maritime Voyage Planning & Multi-Objective Route Optimization Engine"
+requires-python = ">=3.11"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]

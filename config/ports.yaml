@@ -1,0 +1,84 @@
+# Real major tanker ports (public knowledge — coordinates are the port's
+# well-known anchorage/approach position, not a precise berth). Used as
+# origin/destination anchors for synthetic voyage requests in later phases.
+ports:
+  rotterdam:
+    name: "Rotterdam / Europoort"
+    country: NL
+    lon: 4.0
+    lat: 51.95
+  fujairah:
+    name: "Fujairah"
+    country: AE
+    lon: 56.35
+    lat: 25.15
+  singapore:
+    name: "Singapore (Eastern OPL)"
+    country: SG
+    lon: 104.0
+    lat: 1.2
+  houston:
+    name: "Houston Ship Channel"
+    country: US
+    lon: -94.9
+    lat: 29.4
+  ras_tanura:
+    name: "Ras Tanura"
+    country: SA
+    lon: 50.15
+    lat: 26.65
+  primorsk:
+    name: "Primorsk"
+    country: RU
+    lon: 28.7
+    lat: 60.35
+  ceyhan:
+    name: "Ceyhan"
+    country: TR
+    lon: 35.9
+    lat: 36.75
+  ulsan:
+    name: "Ulsan"
+    country: KR
+    lon: 129.4
+    lat: 35.5
+  santos:
+    name: "Santos"
+    country: BR
+    lon: -46.3
+    lat: -24.0
+  corpus_christi:
+    name: "Corpus Christi"
+    country: US
+    lon: -97.4
+    lat: 27.8
+  jubail:
+    name: "Jubail"
+    country: SA
+    lon: 49.7
+    lat: 27.0
+  antwerp:
+    name: "Antwerp"
+    country: BE
+    lon: 4.4
+    lat: 51.3
+  gibraltar:
+    name: "Gibraltar (bunkering anchorage)"
+    country: GI
+    lon: -5.35
+    lat: 36.15
+  panama_pacific:
+    name: "Panama - Pacific approach"
+    country: PA
+    lon: -79.9
+    lat: 8.4
+  panama_atlantic:
+    name: "Panama - Atlantic approach (Cristobal)"
+    country: PA
+    lon: -79.9
+    lat: 9.4
+  yeosu:
+    name: "Yeosu"
+    country: KR
+    lon: 127.75
+    lat: 34.75

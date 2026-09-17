@@ -1,0 +1,61 @@
+# Vessel fuel-speed profiles.
+# No public per-vessel fuel curve exists (proprietary to owners/class societies), so
+# these coefficients are synthetic but literature-grounded: calibrated to the
+# order-of-magnitude cubic speed-consumption relationship reported for tanker classes
+# in published sources (e.g. IMO GHG studies, academic ship-performance literature).
+# This is documented explicitly in findings.md — treat these as representative,
+# not as any specific real vessel's certified figures.
+
+# UNITS (single source of truth — resistance_model.py reads this, never hardcodes 24):
+# fuel_curve outputs consumption in tonnes/day. Any code coupling this against a leg
+# transit time tau_k expressed in hours MUST multiply by hourly_conversion_factor
+# (= 1/24) before multiplying by tau_k, i.e.:
+#   fuel_tonnes_for_leg = F(v, H, W) * hourly_conversion_factor * tau_k_hours
+units:
+  fuel_curve_output: tonnes_per_day
+  hourly_conversion_factor: 0.0416666667   # 1/24 — tonnes/day -> tonnes/hour
+
+vessels:
+  mr2_product_tanker:
+    dwt_tonnes: 50000
+    design_speed_knots: 14.5
+    # F(v, H, W) = a*v^3 + b*v^2*f_wave(H) + c*v*f_wind(W) + d   [tonnes/day]
+    fuel_curve:
+      a: 0.0180
+      b: 0.0065
+      c: 0.0020
+      d: 3.5
+    cargo_condition_factor:
+      laden: 1.00
+      ballast: 0.82   # ~15-25% lower fuel burn in ballast; midpoint used
+    speed_bounds_knots: [9.0, 16.0]
+
+  aframax_tanker:
+    dwt_tonnes: 110000
+    design_speed_knots: 14.0
+    fuel_curve:
+      a: 0.0340
+      b: 0.0110
+      c: 0.0035
+      d: 6.0
+    cargo_condition_factor:
+      laden: 1.00
+      ballast: 0.80
+    speed_bounds_knots: [9.0, 15.5]
+
+  vlcc_tanker:
+    dwt_tonnes: 300000
+    design_speed_knots: 15.5
+    fuel_curve:
+      a: 0.0620
+      b: 0.0190
+      c: 0.0060
+      d: 12.0
+    cargo_condition_factor:
+      laden: 1.00
+      ballast: 0.78
+    speed_bounds_knots: [10.0, 16.5]
+
+eca_compliance:
+  # ECA-compliant fuel (e.g. VLSFO/MGO) price premium over standard HSFO baseline
+  price_premium_usd_per_tonne: 120
