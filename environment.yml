@@ -9,6 +9,9 @@ dependencies:
   - pandas
   - xarray
   - netcdf4
+  - h5netcdf  # fallback NetCDF engine — see navi_opt/weather/weather_field.py's
+              # _open_dataset_with_fallback() docstring: netcdf4 can hit a Windows
+              # DLL conflict with geopandas's bundled GDAL/HDF5; h5netcdf sidesteps it
   - networkx
   - geopandas
   - shapely

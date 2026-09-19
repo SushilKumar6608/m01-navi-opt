@@ -183,3 +183,141 @@ def test_find_k_paths_is_safely_reusable_on_the_same_graph():
     second = solver.find_k_paths("A", "D", k=3)
 
     assert {tuple(r["path"]) for r in first} == {tuple(r["path"]) for r in second}
+
+
+# --- diversity mechanism (enforce_diversity=True) ---
+
+
+def unit_cost_evaluator(u, v, t):
+    """Uniform cost/duration of 1.0 per edge, regardless of endpoints or
+    time. Used with all-zero lat/lon nodes below so CalmWaterAStar's
+    heuristic is always exactly 0 (trivially admissible for ANY edge cost
+    structure) — this isolates the diversity tests from having to keep a
+    synthetic graph's topology consistent with real haversine geometry,
+    which is irrelevant to what's being tested here."""
+    return 1.0, 1.0
+
+
+def _zero_latlon_graph() -> nx.DiGraph:
+    g = nx.DiGraph()
+    for node in ["O", "A", "B", "B2", "C", "E", "D"]:
+        g.add_node(node, lat=0.0, lon=0.0)
+    return g
+
+
+def _three_lane_graph_with_near_duplicate() -> nx.DiGraph:
+    """Three O->D routes, all tied at cost 3.0:
+      lane1:     O-A-B-D
+      near_dup:  O-A-B2-D   (shares O, A, D with lane1 — only B/B2 differ;
+                              Jaccard(lane1, near_dup) = 3/5 = 0.6)
+      lane2:     O-C-E-D    (shares only O, D with either of the above;
+                              Jaccard(lane2, lane1) = Jaccard(lane2, near_dup) = 2/6 = 0.33)
+    Deliberately constructed so lane1 and near_dup are NOT genuinely
+    distinct navigational choices (just a 1-node substitution) while lane2
+    is — exactly the real symptom this feature exists for, at a scale
+    small enough to reason about exactly rather than relying on
+    tie-breaking order in a large real graph.
+    """
+    g = _zero_latlon_graph()
+    for u, v in [("O", "A"), ("A", "B"), ("B", "D"), ("A", "B2"), ("B2", "D"),
+                 ("O", "C"), ("C", "E"), ("E", "D")]:
+        g.add_edge(u, v)
+    return g
+
+
+def test_jaccard_similarity_known_values():
+    solver = YenKShortestPaths(nx.DiGraph(), unit_cost_evaluator)
+    assert solver._jaccard_similarity(["O", "A", "B", "D"], ["O", "A", "B", "D"]) == pytest.approx(1.0)
+    assert solver._jaccard_similarity(["O", "A", "B", "D"], ["O", "A", "B2", "D"]) == pytest.approx(0.6)
+    assert solver._jaccard_similarity(["O", "A", "B", "D"], ["O", "C", "E", "D"]) == pytest.approx(2 / 6)
+    assert solver._jaccard_similarity(["O", "A"], ["C", "E"]) == pytest.approx(0.0)
+
+
+def test_is_diverse_enough_respects_threshold():
+    solver = YenKShortestPaths(nx.DiGraph(), unit_cost_evaluator, diversity_jaccard_threshold=0.5)
+    accepted = [{"path": ["O", "A", "B", "D"]}]
+    # near_dup (jaccard 0.6 >= 0.5 threshold) must be rejected
+    assert solver._is_diverse_enough(["O", "A", "B2", "D"], accepted) is False
+    # lane2 (jaccard 0.33 < 0.5 threshold) must be accepted
+    assert solver._is_diverse_enough(["O", "C", "E", "D"], accepted) is True
+
+
+def test_search_cost_evaluator_penalizes_only_buffered_nodes():
+    g = _three_lane_graph_with_near_duplicate()
+    solver = YenKShortestPaths(g, unit_cost_evaluator, diversity_penalty_factor=0.25)
+    solver._penalized_nodes = {"A", "B"}
+
+    cost, dt = solver._search_cost_evaluator("A", "B", 0.0)
+    assert cost == pytest.approx(1.25)  # both endpoints buffered
+    cost, dt = solver._search_cost_evaluator("O", "C", 0.0)
+    assert cost == pytest.approx(1.0)  # neither endpoint buffered
+    assert dt == pytest.approx(1.0)  # duration is never penalized, only cost
+
+
+def test_grow_penalty_buffer_includes_one_hop_neighbors():
+    g = _three_lane_graph_with_near_duplicate()
+    solver = YenKShortestPaths(g, unit_cost_evaluator, diversity_buffer_hops=1)
+    solver._grow_penalty_buffer(["O", "A"])
+    # 1-hop neighbors of O: A, C. 1-hop neighbors of A: O, B, B2.
+    assert solver._penalized_nodes == {"O", "A", "C", "B", "B2"}
+
+
+def test_diversity_enabled_returns_genuinely_distinct_paths():
+    g = _three_lane_graph_with_near_duplicate()
+    solver = YenKShortestPaths(
+        g, unit_cost_evaluator, enforce_diversity=True, diversity_jaccard_threshold=0.5
+    )
+    results = solver.find_k_paths("O", "D", k=2)
+
+    assert len(results) == 2
+    similarity = solver._jaccard_similarity(results[0]["path"], results[1]["path"])
+    assert similarity < 0.5, (
+        f"returned paths {results[0]['path']} and {results[1]['path']} are too similar "
+        f"(jaccard={similarity:.2f}) — the diversity gate should have prevented this"
+    )
+
+
+def test_diversity_enabled_still_reports_true_cost_not_penalized_cost():
+    # The core correctness property: whatever the search internally biased
+    # itself with, every reported total_cost must match an independent
+    # recomputation via the TRUE (unpenalized) evaluator.
+    g = _three_lane_graph_with_near_duplicate()
+    solver = YenKShortestPaths(
+        g, unit_cost_evaluator, enforce_diversity=True, diversity_jaccard_threshold=0.5
+    )
+    results = solver.find_k_paths("O", "D", k=2, start_time_hours=10.0)
+
+    for r in results:
+        true_cost, true_arrival = solver._compute_path_cost_and_time(r["path"], 10.0)
+        assert r["total_cost"] == pytest.approx(true_cost, abs=0.01)
+        assert r["arrival_time_hours"] == pytest.approx(true_arrival, abs=0.01)
+        # every edge costs exactly 1.0 unpenalized — a leaked penalty would
+        # inflate this above len(path)-1
+        assert r["total_cost"] == pytest.approx(len(r["path"]) - 1, abs=0.01)
+
+
+def test_diversity_gracefully_returns_fewer_than_k_when_no_alternative_exists():
+    # A single O->D chain with no alternate routing at all — even with
+    # enforce_diversity on and k=5, there is only ever 1 path to return,
+    # and it must come back as 1 result, not an error.
+    g = _zero_latlon_graph()
+    for u, v in [("O", "A"), ("A", "B"), ("B", "D")]:
+        g.add_edge(u, v)
+    solver = YenKShortestPaths(g, unit_cost_evaluator, enforce_diversity=True)
+    results = solver.find_k_paths("O", "D", k=5)
+    assert len(results) == 1
+    assert results[0]["path"] == ["O", "A", "B", "D"]
+
+
+def test_enforce_diversity_defaults_to_false():
+    g = _three_lane_graph_with_near_duplicate()
+    solver = YenKShortestPaths(g, unit_cost_evaluator)
+    assert solver.enforce_diversity is False
+    # with diversity off, near-duplicate pairing is a possible (not
+    # asserted-exact, since tie-breaking order isn't part of this class's
+    # contract) outcome — what matters is it still returns valid results
+    # without the diversity machinery interfering.
+    results = solver.find_k_paths("O", "D", k=2)
+    assert len(results) == 2
+    for r in results:
+        assert r["path"][0] == "O" and r["path"][-1] == "D"

@@ -22,6 +22,27 @@ Dataset choices (confirmed against the CMEMS catalogue, Sep 2026):
   catalogue via scripts/describe_cmems_datasets.py (not guessed):
     wave: VHM0  (sea_surface_wave_significant_height)
     wind: eastward_wind, northward_wind  (CF standard names, as expected)
+
+Two ways to get the data, below:
+
+`fetch_wave_field()`/`fetch_wind_field()` call `copernicusmarine.subset()`,
+which downloads a local `.nc` file — then something downstream (this
+project: `weather_field.open_weather_field()`) has to open it via
+netCDF4/h5netcdf, which requires a working local HDF5 install. On a first
+real run (Sep 2026) this hit an unresolvable Windows conda HDF5/netCDF4 DLL
+conflict — reinstalling netCDF4, then h5netcdf, then force-rebuilding the
+whole HDF5 stack from conda-forge each moved the failure to a different
+package without fixing it (findings.md has the full sequence). Kept here
+for anyone who wants the file cached locally and has a working HDF5 stack.
+
+`open_wave_field()`/`open_wind_field()` call `copernicusmarine.open_dataset()`
+instead, which streams the subset directly into memory via zarr/fsspec — a
+pure-Python path with NO local netCDF4/HDF5 dependency at all. This is what
+`weather_field.open_weather_field_remote()` actually uses, specifically to
+sidestep the DLL conflict above rather than trying to fix a machine-specific
+Windows conda environment problem. Prefer these unless you specifically need
+the `.nc` files persisted to disk and have already confirmed your local
+netCDF4/h5netcdf install actually works.
 """
 from __future__ import annotations
 
@@ -30,6 +51,7 @@ from datetime import datetime
 from pathlib import Path
 
 import copernicusmarine
+import xarray as xr
 
 WAVE_DATASET_ID = "cmems_mod_glo_wav_anfc_0.083deg_PT3H-i"
 WIND_DATASET_ID = "cmems_obs-wind_glo_phy_my_l4_0.125deg_PT1H"
@@ -90,6 +112,68 @@ def fetch_wave_field(
         overwrite=True,
     )
     return output_dir / output_filename
+
+
+def open_wave_field(
+    west: float,
+    south: float,
+    east: float,
+    north: float,
+    start: datetime,
+    end: datetime,
+    variables: list[str] | None = None,
+) -> xr.Dataset:
+    """Reads a wave-height subset directly from CMEMS's remote store into
+    an in-memory xarray.Dataset via `copernicusmarine.open_dataset()` (zarr/
+    fsspec) — no local `.nc` file is ever written or read, so this has no
+    local netCDF4/HDF5 dependency at all. See module docstring for why this
+    is the recommended path over `fetch_wave_field()`.
+
+    `.load()` pulls the whole (bbox x time-window) subset into memory in
+    one transfer, so repeated point sampling downstream (`weather_field.py`'s
+    `WeatherField.sample()`, called once per leg per solver iteration) never
+    triggers a repeat network round-trip.
+    """
+    username, password = _credentials_from_env()
+    ds = copernicusmarine.open_dataset(
+        dataset_id=WAVE_DATASET_ID,
+        username=username,
+        password=password,
+        variables=variables or WAVE_VARIABLES,
+        minimum_longitude=west,
+        maximum_longitude=east,
+        minimum_latitude=south,
+        maximum_latitude=north,
+        start_datetime=start,
+        end_datetime=end,
+    )
+    return ds.load()
+
+
+def open_wind_field(
+    west: float,
+    south: float,
+    east: float,
+    north: float,
+    start: datetime,
+    end: datetime,
+    variables: list[str] | None = None,
+) -> xr.Dataset:
+    """Wind-component equivalent of `open_wave_field()` — see its docstring."""
+    username, password = _credentials_from_env()
+    ds = copernicusmarine.open_dataset(
+        dataset_id=WIND_DATASET_ID,
+        username=username,
+        password=password,
+        variables=variables or WIND_VARIABLES,
+        minimum_longitude=west,
+        maximum_longitude=east,
+        minimum_latitude=south,
+        maximum_latitude=north,
+        start_datetime=start,
+        end_datetime=end,
+    )
+    return ds.load()
 
 
 def fetch_wind_field(
