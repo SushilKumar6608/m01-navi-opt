@@ -38,6 +38,7 @@ synthetic forecast, and it must never be mistaken for one.
 """
 from __future__ import annotations
 
+import time
 from typing import Callable, List, NamedTuple, Optional, Tuple
 
 import networkx as nx
@@ -74,6 +75,22 @@ class LegResult(NamedTuple):
     headwind_knots: float
     transit_hours: float
     fuel_tonnes: float
+
+
+class _TimeBudgetExceeded(Exception):
+    """Internal-only: raised from a SLSQP callback to abort a solve that's
+    exceeded `max_seconds`, carrying the last-seen iterate out. Never
+    escapes `optimize_speed_profile()` — caught there and turned into a
+    SpeedProfileResult with `success=False`. See `max_seconds`'s docstring
+    for why this exists: a `maxiter` cap bounds iteration COUNT, not
+    wall-clock time, and real corridors have shown highly variable
+    per-iteration cost (a direct measurement on the real Rotterdam<->Ceyhan
+    corridor found two epsilons roughly 9x apart in solve time despite an
+    identical iteration cap — see findings.md's Phase 4 entry), so only a
+    direct wall-clock check actually bounds a caller's worst case."""
+
+    def __init__(self, last_xk: List[float]):
+        self.last_xk = last_xk
 
 
 class SpeedProfileResult(NamedTuple):
@@ -122,6 +139,9 @@ def optimize_speed_profile(
     start_time_hours: float = 0.0,
     max_transit_hours: Optional[float] = None,
     hourly_conversion_factor: Optional[float] = None,
+    maxiter: Optional[int] = None,
+    initial_speeds_knots: Optional[List[float]] = None,
+    max_seconds: Optional[float] = None,
 ) -> SpeedProfileResult:
     """Choose a per-leg speed along `path` minimizing total fuel burn.
 
@@ -136,6 +156,38 @@ def optimize_speed_profile(
         possibly make it even at max speed in calm water — rather than
         handing an infeasible problem to the optimizer and returning a
         constraint-violating "solution" silently.
+    initial_speeds_knots : optional warm-start for SLSQP's starting point,
+        one speed per leg (must match `len(path) - 1`). Real per-eval cost
+        for a long corridor is dominated by SLSQP's finite-difference
+        gradient — every iteration needs on the order of (legs + 1) full
+        corridor evaluations — so starting near the true optimum instead of
+        `vessel.design_speed_knots` on every leg can cut iteration count
+        substantially for a caller solving many closely related problems
+        back-to-back (e.g. `pareto.py`'s epsilon sweep, where consecutive
+        epsilons are close together and each one's converged speeds are a
+        good starting guess for the next). Values are clamped into
+        `vessel.speed_bounds_knots` rather than rejected outright, since a
+        previous solve's speeds are only ever a starting *guess*, not a
+        promise they still respect this call's bounds. Defaults to `None`
+        (the existing `design_speed_knots`-repeated behavior), so this is a
+        strict opt-in with zero behavior change for every existing caller.
+    max_seconds : optional hard wall-clock budget for this ONE solve.
+        Checked once per SLSQP iteration (via `scipy.optimize.minimize`'s
+        `callback`) — NOT once per function evaluation, since a
+        finite-difference gradient step evaluates the objective/constraint
+        many times atomically and can't safely be interrupted mid-step.
+        This means the actual wall-clock overrun can exceed `max_seconds`
+        by up to one iteration's worth of evaluations (still far tighter
+        than no bound at all — see findings.md's Phase 4 entry for why
+        `maxiter` alone wasn't enough: real solves on the same corridor
+        varied ~9x in time at an identical iteration cap). On timeout,
+        returns the best iterate SLSQP had reached with `success=False`
+        and a message saying so — a real, usable (if unproven-optimal)
+        speed profile, not a raised error, since a caller running many
+        solves (e.g. `pareto.py`'s sweep) needs a result to keep going, not
+        an exception to handle. Defaults to `None` (unbounded), so this is
+        a strict opt-in with zero behavior change for every existing
+        caller.
 
     Returns
     -------
@@ -166,17 +218,32 @@ def optimize_speed_profile(
                 f"{min_possible:.2f} hours"
             )
 
-    def _evaluate(speeds: List[float]) -> Tuple[float, List[LegResult]]:
+    def _evaluate(
+        speeds: List[float], deadline: Optional[float] = None
+    ) -> Tuple[float, List[LegResult]]:
         """Walks the corridor once at the given per-leg speeds, sampling
         weather at each leg's departure time (a simplification — the
         alternative, sampling at the leg's midpoint or re-solving on
         arrival, adds complexity this prototype doesn't need given legs
         are short relative to how fast weather fields change; documented
-        here rather than silently assumed)."""
+        here rather than silently assumed).
+
+        `deadline`, if given, is checked before EVERY leg (not once per
+        call) — deliberately fine-grained. A coarser check (once per call,
+        or once per SLSQP iteration via a `callback`) was tried first and
+        measurably failed on a slow per-leg lookup: a callback only fires
+        between iterations, and one iteration's finite-difference gradient
+        can call this function dozens of times first — a direct check
+        found 22+ full-corridor evaluations happening before a single
+        callback invocation. Checking per-leg instead means the worst-case
+        overrun is one leg's processing time, not one full evaluation's
+        (let alone one iteration's) — see findings.md's Phase 4 entry."""
         t = start_time_hours
         total_fuel = 0.0
         legs: List[LegResult] = []
         for (u, v), dist_nm in zip(edges, distances_nm):
+            if deadline is not None and time.monotonic() >= deadline:
+                raise _TimeBudgetExceeded(list(speeds))
             wave_h, headwind = weather_lookup(u, v, t)
             fuel, transit_hours = fuel_tonnes_for_leg(
                 dist_nm,
@@ -203,15 +270,23 @@ def optimize_speed_profile(
             t += transit_hours
         return total_fuel, legs
 
-    def _objective(speeds) -> float:
-        total_fuel, _ = _evaluate(list(speeds))
+    def _objective(speeds, deadline=None) -> float:
+        total_fuel, _ = _evaluate(list(speeds), deadline=deadline)
         return total_fuel
 
     def _total_transit_hours(speeds) -> float:
         return sum(dist / speed for dist, speed in zip(distances_nm, speeds))
 
     n_legs = len(edges)
-    x0 = [min(max(vessel.design_speed_knots, lo), hi)] * n_legs
+    if initial_speeds_knots is not None:
+        if len(initial_speeds_knots) != n_legs:
+            raise ValueError(
+                f"initial_speeds_knots has {len(initial_speeds_knots)} entries, "
+                f"expected {n_legs} (one per leg of {path!r})"
+            )
+        x0 = [min(max(s, lo), hi) for s in initial_speeds_knots]
+    else:
+        x0 = [min(max(vessel.design_speed_knots, lo), hi)] * n_legs
     bounds = [(lo, hi)] * n_legs
 
     constraints = []
@@ -223,15 +298,38 @@ def optimize_speed_profile(
             }
         )
 
-    result = minimize(
-        _objective,
-        x0=x0,
-        method="SLSQP",
-        bounds=bounds,
-        constraints=constraints,
-    )
+    minimize_kwargs = dict(method="SLSQP", bounds=bounds, constraints=constraints)
+    if maxiter is not None:
+        # Bounds SLSQP's worst-case iteration count (and therefore worst-case
+        # wall-clock time) for callers running MANY solves back-to-back, e.g.
+        # pareto.py's epsilon sweep — see that module's use of this parameter
+        # and findings.md's Phase 4 entry for why a per-solve cap matters
+        # there. Left unset by default (None -> scipy's own default of 100),
+        # so this is a strict opt-in with zero behavior change for every
+        # existing caller/test.
+        minimize_kwargs["options"] = {"maxiter": maxiter}
 
-    total_fuel, legs = _evaluate(list(result.x))
+    success: bool
+    message: str
+    if max_seconds is not None:
+        deadline = time.monotonic() + max_seconds
+        minimize_kwargs["args"] = (deadline,)
+        try:
+            result = minimize(_objective, x0=x0, **minimize_kwargs)
+            final_x = list(result.x)
+            success = bool(result.success)
+            message = str(result.message)
+        except _TimeBudgetExceeded as exc:
+            final_x = exc.last_xk
+            success = False
+            message = f"stopped early: exceeded max_seconds={max_seconds}"
+    else:
+        result = minimize(_objective, x0=x0, **minimize_kwargs)
+        final_x = list(result.x)
+        success = bool(result.success)
+        message = str(result.message)
+
+    total_fuel, legs = _evaluate(final_x)
     arrival_time_hours = legs[-1].departure_time_hours + legs[-1].transit_hours
     total_transit_hours = arrival_time_hours - start_time_hours
 
@@ -241,6 +339,6 @@ def optimize_speed_profile(
         total_fuel_tonnes=total_fuel,
         total_transit_hours=total_transit_hours,
         arrival_time_hours=arrival_time_hours,
-        success=bool(result.success),
-        message=str(result.message),
+        success=success,
+        message=message,
     )

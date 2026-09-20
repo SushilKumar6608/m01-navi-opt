@@ -71,6 +71,11 @@ FETCH_WINDOW = timedelta(days=16)
 
 V_MAX_KNOTS = 16.0
 
+# Step 6's laycan deadline: 15% margin over each corridor's fastest-possible
+# transit (flat-out at V_MAX_KNOTS) — tight enough to force real per-leg
+# speed variation rather than a token constraint the optimizer can ignore.
+LAYCAN_MARGIN_OVER_MIN = 1.15
+
 
 def calm_water_cost_evaluator(digraph):
     def _evaluator(u, v, current_t):
@@ -137,6 +142,61 @@ def main() -> None:
               f"{calm.total_transit_hours:.1f}h transit")
         print(f"     real-weather-aware:   {real.total_fuel_tonnes:.1f}t fuel, "
               f"{real.total_transit_hours:.1f}h transit  "
+              f"({delta_fuel:+.1f}t / {pct:+.1f}% vs. calm-water)")
+
+    # Step 5 never actually lets weather compete against a schedule: with no
+    # max_transit_hours, optimize_speed_profile() always converges to every
+    # leg's minimum speed bound (strictly cheaper on fuel absent time
+    # pressure — see speed_profile.py's own docstring and Phase 2's
+    # test_no_deadline_picks_minimum_speed_bound_exactly), so weather can
+    # only ever show up as extra fuel at an already-fixed transit time.
+    # A binding deadline is the actual test: it forces speed variation, and
+    # since this model's wave/wind resistance terms scale with speed
+    # (b*v^2*H, c*v*W in resistance_model.py), the MARGINAL cost of going
+    # faster is higher on a rough leg than a calm one — a weather-aware
+    # optimizer should push speed onto the calmer legs and ease off the
+    # rough ones to hit the same deadline more cheaply, which a calm-water
+    # optimization has no reason to do. That reallocation, not just a bigger
+    # fuel number, is the point of this comparison.
+    print("\n6. Tight-laycan comparison: same corridors under a binding deadline.")
+    print("   (Deadline = 15% margin over each corridor's fastest-possible transit, flat-out at "
+          f"{V_MAX_KNOTS:.0f} kn — tight enough to force real speed variation, not just a token "
+          "constraint. Expect achieved transit time to land almost exactly on the deadline in "
+          "both scenarios, since going faster than required only burns fuel for nothing — the "
+          "fuel delta and the per-leg speed spread are what actually matter here.)")
+    for i, corridor in enumerate(corridors, start=1):
+        path = corridor["path"]
+        total_dist_nm = sum(digraph[u][v]["dist_nm"] for u, v in zip(path, path[1:]))
+        min_possible_hours = total_dist_nm / V_MAX_KNOTS
+        deadline_hours = min_possible_hours * LAYCAN_MARGIN_OVER_MIN
+
+        calm_tight = optimize_speed_profile(
+            path, digraph, vessel, "laden",
+            weather_lookup=calm_weather_lookup, max_transit_hours=deadline_hours,
+        )
+        try:
+            real_tight = optimize_speed_profile(
+                path, digraph, vessel, "laden",
+                weather_lookup=weather_lookup, max_transit_hours=deadline_hours,
+            )
+        except ValueError as exc:
+            print(f"\n   Corridor {i}: deadline {deadline_hours:.1f}h — weather-aware run "
+                  f"FAILED (possibly infeasible under real conditions): {exc}")
+            continue
+
+        calm_speeds = [leg.speed_knots for leg in calm_tight.legs]
+        real_speeds = [leg.speed_knots for leg in real_tight.legs]
+        delta_fuel = real_tight.total_fuel_tonnes - calm_tight.total_fuel_tonnes
+        pct = 100.0 * delta_fuel / calm_tight.total_fuel_tonnes
+
+        print(f"\n   Corridor {i}: deadline {deadline_hours:.1f}h "
+              f"(floor {min_possible_hours:.1f}h flat-out, {LAYCAN_MARGIN_OVER_MIN:.0%} margin)")
+        print(f"     calm-water:   {calm_tight.total_fuel_tonnes:.1f}t fuel, "
+              f"{calm_tight.total_transit_hours:.1f}h transit, success={calm_tight.success}, "
+              f"speed range {min(calm_speeds):.1f}-{max(calm_speeds):.1f}kn")
+        print(f"     real-weather: {real_tight.total_fuel_tonnes:.1f}t fuel, "
+              f"{real_tight.total_transit_hours:.1f}h transit, success={real_tight.success}, "
+              f"speed range {min(real_speeds):.1f}-{max(real_speeds):.1f}kn  "
               f"({delta_fuel:+.1f}t / {pct:+.1f}% vs. calm-water)")
 
 

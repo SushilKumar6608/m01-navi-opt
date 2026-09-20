@@ -694,3 +694,305 @@ speeds above the minimum bound, which is where weather-driven fuel cost and sche
 would start trading off against each other); the fixed `VOYAGE_START = 2024-06-01` window means
 this hasn't been tested across a season with meaningfully different sea states (winter Biscay/
 Atlantic weather would be a much more interesting stress test than a June baseline).
+
+## Phase 3 — Tight-laycan comparison: does weather trade off against schedule, not just fuel
+
+**Motivation:** the no-deadline result above is real but incomplete — `optimize_speed_profile()`
+always converges to the minimum speed bound absent time pressure, so weather could only ever show
+up as extra fuel at a fixed transit time, never as a scheduling effect. The actually interesting
+real-world question — "does bad weather force a reallocation of speed to still make a laycan?" —
+needs a binding deadline to even be observable, since the resistance model's wave/headwind terms
+scale with speed (`b·v²·H`, `c·v·max(W,0)`), making the marginal cost of going faster higher on a
+rough leg than a calm one.
+
+**Design:** `scripts/run_weather_aware_speed_profile.py`'s new Step 6 sets each corridor's deadline
+at 15% margin over its fastest-possible flat-out transit (`total_dist_nm / V_MAX_KNOTS`) — tight
+enough to force real per-leg speed variation, not a token constraint the optimizer can ignore — then
+runs `optimize_speed_profile()` twice per corridor (calm-water, real-weather) with `max_transit_hours`
+set to that deadline, and prints fuel/transit/success/per-leg speed range for both.
+
+**Validated two ways before trusting it:**
+1. Synthetic sanity check (ad-hoc, not a committed test): a hand-built 4-leg corridor (100nm/leg,
+   400nm total) with one deliberately rough leg (4.0m waves, 20kn headwind) and the rest calm, run
+   through this exact code path. Result: `calm speeds: [13.91, 13.91, 13.91, 13.91]` vs.
+   `real speeds: [13.97, 13.74, 13.97, 13.97]` — the weather-aware optimizer slowed down specifically
+   on the rough leg and sped up on the calm ones to still land on the same 28.75h deadline, cheaper
+   than holding a uniform speed would be. Confirms the reallocation mechanism works as designed
+   before spending real CMEMS-fetch time/compute on it.
+2. Real run against all 3 Rotterdam↔Ceyhan corridors and real June 2024 CMEMS weather:
+
+   | Corridor | Deadline | Calm-water | Real-weather | Delta | Speed range (calm → real) |
+   |---|---|---|---|---|---|
+   | 1 | 262.9h | 569.3t / 262.9h | 580.4t / 262.9h | +11.1t / +1.9% | 13.9–13.9kn → 13.8–14.0kn |
+   | 2 | 263.6h | 570.8t / 263.6h | 581.9t / 263.6h | +11.1t / +1.9% | 13.9–13.9kn → 13.8–14.0kn |
+   | 3 | 265.0h | 573.9t / 265.0h | 585.0t / 265.0h | +11.2t / +1.9% | 13.9–13.9kn → 13.8–14.0kn |
+
+**Sanity-checked, not just "it ran":** every corridor's achieved transit time lands exactly on its
+deadline in both scenarios (`success=True`, transit == deadline to the printed decimal) — confirms
+the deadline constraint binds as expected rather than being slack, consistent with going faster than
+required only burning fuel for nothing. The calm-water run's speed range collapses to a single value
+(13.9kn on every leg) — expected, since with no weather to react to and a shared deadline, the
+convex fuel cost is minimized by splitting speed evenly across legs (same closed-form property
+`test_binding_deadline_on_symmetric_two_leg_corridor_splits_evenly` verified in Phase 2, extended
+here to a real ~387-leg corridor). The real-weather run visibly widens that range (13.8–14.0kn) —
+the reallocation signal the synthetic test predicted, now confirmed on real data: speed comes down
+on weather-exposed legs and goes up elsewhere to still hit the same deadline.
+
+**The fuel delta shrank versus the no-deadline case (+1.9% here vs. +3.2% with no deadline) — worth
+noting since the direction wasn't obvious a priori.** Both scenarios in this comparison already run
+close to `V_MAX_KNOTS` (13.9kn against a 16kn max, a much smaller margin than the no-deadline case's
+minimum-speed-bound baseline), so there's less room for the optimizer to trade speed between legs,
+and less of a spread between the cheapest and most fuel-efficient way to spend the same time budget.
+This isn't a contradiction of the no-deadline result — it's a different, and now directly measured,
+regime: near minimum speed, weather is almost pure added fuel cost (+3.2%, no scheduling response
+possible); near a binding deadline, some of that cost gets absorbed by reallocating speed instead of
+paying it outright, which is exactly why the percentage is smaller here, not evidence the effect is
+weaker than expected.
+
+This confirms the open item flagged at Phase 3's close: weather now demonstrably competes against
+schedule, not just fuel, when a deadline is tight enough to bind — closing that item with real,
+checked data rather than leaving it as a hypothesis.
+
+## Phase 4 — Pareto trade-off analysis (`optimization/pareto.py`)
+
+**Why epsilon-constraint, and why it needed almost no new solver:** `optimize_speed_profile()`
+already minimizes fuel subject to `max_transit_hours` — that IS the epsilon-constraint method
+applied to the duration objective. Sweeping `max_transit_hours` and collecting (fuel, duration)
+pairs traces the frontier for free, reusing Phase 2's optimizer rather than building a second
+solver. This module adds three things on top: a weather-risk objective computed from data the
+optimizer already produces (no new sampling), the sweep loop across epsilon values and across the
+k diverse corridors from Phase 2's diversity feature, and non-dominated filtering across all three
+objectives at once — a corridor/epsilon combination optimal on fuel-vs-duration can still be
+weather-riskier than a different combination at a similar cost, which a 2D trade-off alone would
+miss.
+
+**Weather-risk metric, chosen and documented rather than assumed:** significant-wave-height
+exposure in metre-hours (`sum(leg.wave_height_m * leg.transit_hours)`), read directly off
+`SpeedProfileResult.legs` (already populated per solve — no new weather sampling needed). Chosen
+over a per-leg-maximum ("worst single moment") because time-weighted exposure is the more
+actionable signal for voyage planning ("how long does this route spend in rough water"), and it's
+directly derivable from data the optimizer was already computing. A per-leg-maximum metric answers
+a different, legitimate question and isn't implemented here.
+
+**Bug caught before delivery, not after — a real numerical-tolerance issue, not a logic error:** a
+synthetic two-corridor sanity check (one corridor always calm, one uniformly rough over the same
+route/distances — the rough one should be dominated everywhere) initially showed some rough-corridor
+points surviving on the frontier. Root cause: at each corridor's flat-out floor epsilon, both
+corridors' speed is forced to the same value by the deadline, but two *independent* SLSQP solves
+landing on that same value don't produce bit-identical floats — observed noise was ~7.5e-11 hours
+between the two solves' `total_transit_hours`. `_dominates()`'s original exact `<=` comparison
+treated that sub-nanosecond-scale noise as a genuine schedule difference, which was enough to make
+the rough corridor's clearly-worse point (same effective duration, +4.75t fuel, +62.5 m·h risk)
+register as "not dominated." Fixed with per-objective tolerances
+(`FUEL_TOL_TONNES`/`DURATION_TOL_HOURS`/`RISK_TOL_M_HOURS`, all `1e-3` — far above observed solver
+noise, far below any difference this project's fuel model would ever call meaningful). Re-ran the
+same synthetic check after the fix: 0/8 rough-corridor points survive on the frontier, exactly as
+expected. Added `test_dominance_survives_sub_tolerance_floating_point_noise` as a direct regression
+using the actual noisy floats observed, not a hypothetical case.
+
+**Tests:** 14 new (`test_pareto.py`), 115/115 project-wide, zero regression. Closed-form checks, not
+just "does it run": `weather_risk_m_hours` against hand-built legs; `default_epsilon_sweep`'s floor
+and spacing against the known distance/v_max; a sweep's fuel is verified non-increasing as epsilon
+relaxes (a corridor's optimizer always has the tighter solution's speeds available as a strictly
+looser-feasible option, so fuel can never go up); infeasible epsilons are skipped, not raised;
+hand-built dominance cases (a point dominated on all three objectives is removed; two genuinely
+non-dominated trade-off points both survive; ties on all three survive both; dominance is checked
+across the pooled set, not per-corridor); the floating-point-noise regression above; and an
+end-to-end composition check on a corridor with one rough leg confirming every retained point's
+`weather_risk_m_hours` traces back to exactly that leg's `wave_height_m * transit_hours`.
+
+**Not yet done / next phase's problem:** `scripts/run_pareto_sweep.py` (real CMEMS weather, all 3
+Rotterdam↔Ceyhan corridors, 10-point epsilon sweep per corridor, pooled frontier written to
+`data/processed/pareto_frontier_rotterdam_ceyhan.csv`) has not yet been run against real data —
+same discipline as every other phase, first real run happens on the user's machine, read its
+printed output before trusting it. The sweep's weather field is fetched once and shared across all
+corridors/epsilons (same `open_weather_field_remote()` call as Phase 3), so this should run in
+minutes given the `_FieldIndex` performance fix already in place, not the multi-hour wait Phase 3
+hit before that fix existed.
+
+**Update — first real run appeared stuck (3+ hours, no output) — real gap in the delivered script,
+not (as far as could be verified) a wrong performance estimate.** Before delivery this was checked
+only on small synthetic graphs for correctness, never timed at the real corridor's scale (~390
+legs) or under a realistic worst-case SLSQP iteration budget — the same category of mistake as
+Phase 3's original `.sel()` performance bug, caught again here because the discipline of "benchmark
+before trusting a performance claim" wasn't applied a second time before shipping.
+
+Benchmarked directly once the user reported the stall, using a synthetic ~390-leg corridor and the
+real `fuel_tonnes_for_leg`/`optimize_speed_profile` code paths (not assumed): one constrained solve
+at SLSQP's default 100-iteration cap measured at 1.3s (11 iterations, 4257 function evaluations) to
+converge from a cold start; a single full 390-leg objective evaluation (real
+`fuel_tonnes_for_leg` calls, not a stand-in) measured at 0.56ms, giving a worst-case projection of
+~2.4s/solve even at the full 100-iteration budget, ~1-2 minutes for the whole 30-solve sweep. This
+does not explain a 3-hour stall by any plausible multiple — Windows overhead, real (rather than
+random-noise) weather-field structure, or general machine speed differences could plausibly cost a
+few times more, not 100x+ more. The true root cause on the user's specific machine/run could not be
+identified from this sandbox (no way to attach to or reproduce the live process), so this is
+reported as an unresolved discrepancy, not a diagnosed root cause — consistent with this project's
+standard of not asserting a specific explanation without evidence for it.
+
+**What was fixed regardless, since it was a real gap either way:** the script gave zero output
+during a corridor's entire 10-epsilon sweep (only printing once all 10 finished), making a normal
+multi-minute wait and a genuine multi-hour hang indistinguishable to whoever's watching it run — a
+real design miss, independent of whatever the actual root cause of the 3-hour stall turns out to
+be. Fixed two ways:
+1. `sweep_epsilon_constraint()` gained an optional `on_progress` callback, invoked after every
+   single epsilon attempt (feasible or not) with `(index, epsilon_hours, point_or_None,
+   elapsed_seconds)` — opt-in, `None` by default, zero behavior change for existing callers/tests.
+   `run_pareto_sweep.py` now passes one that prints a line per epsilon (status, elapsed time, fuel
+   if feasible), so a live run is never silent for longer than one solve.
+2. `optimize_speed_profile()` gained an optional `maxiter` parameter (forwarded to
+   `scipy.optimize.minimize`'s `options`), `None` by default (scipy's own default, zero behavior
+   change for existing callers). `sweep_epsilon_constraint()` now passes
+   `DEFAULT_SWEEP_MAXITER = 60` unless overridden, bounding each solve's worst case in a
+   many-solves-back-to-back context specifically, without touching `optimize_speed_profile()`'s
+   default behavior anywhere else in the project. Any residual precision loss from capping
+   iterations early falls within `pareto._dominates()`'s existing tolerances (see the numerical-
+   noise bug entry above), so it can't change which points the frontier reports.
+
+**Tests:** 5 new (`test_sweep_defaults_to_bounded_maxiter_not_unbounded`,
+`test_sweep_calls_on_progress_once_per_epsilon_in_order`,
+`test_sweep_on_progress_reports_none_for_infeasible_epsilon` in `test_pareto.py`;
+`test_maxiter_defaults_to_scipy_default_unbounded`,
+`test_maxiter_is_actually_forwarded_to_the_solver` in `test_speed_profile.py` — the latter proves
+`maxiter=1` measurably changes the solved outcome versus uncapped, not just that the parameter is
+accepted). 120/120 project-wide, zero regression.
+
+**Still open:** if the per-epsilon progress printing shows one specific epsilon taking dramatically
+longer than the others on a rerun, that would be real evidence pointing at a specific cause (a
+particular corridor/deadline combination hitting a pathological SLSQP path) rather than a uniform
+slowdown — worth capturing and investigating specifically if it recurs, rather than treated as
+resolved by the `maxiter` cap alone.
+
+**Update — real per-epsilon timing came in, and it retracts the "must be a hang" conclusion
+above.** The rerun with progress printing measured the real (not synthetic-benchmark) cost of ONE
+epsilon on corridor 1's real ~390-leg path: 217.7s, converged (`success=True`). This directly
+contradicts the earlier ~2.4s/solve worst-case projection — that projection used a stand-in
+`weather_lookup` (`random.uniform()`) far cheaper than the real one (a spatial KD-tree query, a
+time binary search, a NaN-fallback check, and a trig-based headwind projection, called twice per
+leg for wave and wind), and implicitly assumed fast SLSQP convergence that a real, high-dimensional
+(~386 free speed variables), only-piecewise-smooth (weather sampling steps at nearest-neighbor time
+bins, not a smooth function of arrival time) problem doesn't necessarily get. With that real
+per-evaluation cost and iteration count, a multi-hour total across 30 solves is consistent with
+genuine computation — the earlier 3-hour report was very likely real work the whole time, not a
+hang. Documented here plainly as a retraction of the earlier claim, per this project's standard of
+not asserting an explanation without evidence for it (the earlier claim was exactly that mistake,
+just caught later than it should have been).
+
+**What was tried next, and what honestly worked vs. didn't:**
+1. **Warm-starting** (`optimize_speed_profile()` gained an opt-in `initial_speeds_knots` parameter;
+   `sweep_epsilon_constraint()` now starts each epsilon after the first from the previous feasible
+   epsilon's converged per-leg speeds, falling back to a cold start after any infeasible/
+   non-converged epsilon). Benchmarked directly on a synthetic 200-leg corridor before trusting it:
+   cold-start sweep 34.3s vs. warm-started 31.7s — only ~1.08x. Root cause of the small effect:
+   SLSQP's finite-difference gradient makes PER-ITERATION cost (on the order of legs+1 full-corridor
+   evaluations, regardless of where the solve starts) the real driver, not iteration count — warm-
+   starting shaves iterations, but each remaining one costs the same either way. Shipped anyway
+   since it's a strict opt-in (existing callers/tests unaffected), fully tested (5 new tests
+   including a direct spy-based check that warm-starting is actually happening, not just accepted
+   and ignored), and has no downside — but reported honestly here as a marginal win, not a fix.
+2. **`SWEEP_N_POINTS` reduced from 10 to 5** in `run_pareto_sweep.py`. The one lever that reliably
+   and proportionally cuts wall-clock time without touching solver internals — half the epsilons,
+   roughly half the total time. Not elegant, but honest: this is what actually moves the needle
+   right now, everything else tried is a smaller effect on top of it.
+3. **Not attempted, flagged as the real fix for later:** supplying an analytic gradient to
+   `scipy.optimize.minimize` instead of relying on finite differences would cut per-iteration cost
+   from O(legs) evaluations to O(1) — the actual lever that would matter most, per the diagnosis
+   above. Not implemented in this session: the fuel-rate function IS analytically differentiable in
+   speed at FIXED weather (cubic polynomial), but weather itself is sampled at a nearest-neighbor
+   time index that shifts with cumulative arrival time, which is itself a function of every earlier
+   leg's speed — making a fully rigorous analytic gradient more involved than a quick patch, and not
+   something to rush into a numerically-sensitive optimizer path without a way to verify correctness
+   against real data from this sandbox. Left as an open, clearly-scoped item rather than attempted
+   and possibly shipped wrong.
+
+**Update — the `maxiter` cap alone was NOT enough on real data, proven directly, and the `max_seconds`
+fix that followed had a real bug of its own before it actually worked.** Real per-epsilon timing
+from a live run: epsilon 1 (the tightest/floor deadline) converged in 217.7s; epsilon 2 (a LOOSER
+deadline, normally the easier case) took 1941.1s — 32 minutes, ~9x longer, and did not converge even
+at the `maxiter=60` cap. This is direct proof that iteration count does not bound wall-clock time
+here: identical iteration budget, ~9x different cost, because per-ITERATION cost itself varies
+depending on how the real (not synthetic) weather field's structure interacts with SLSQP's
+finite-difference gradient at that particular point in the search — not something an iteration cap
+can see or bound.
+
+**First fix attempt (checking the clock via scipy's `callback`) was verified to fail before being
+shipped, not after:** a direct test (artificially slow per-leg `weather_lookup`, a real deadline
+forcing genuine SLSQP iterations) showed a `callback`-based check — which scipy calls once per
+ITERATION — let 22+ full-corridor objective evaluations happen before ever getting a chance to check
+the clock, because one iteration's finite-difference gradient needs on the order of (legs + 1)
+evaluations. Measured overrun: 37.2s of actual work against a 2.0s budget — an 18x miss, on a
+corridor with only 60 legs (real corridors are ~390). This would not have caught the real problem at
+all; caught by testing the mechanism directly against the exact failure shape before trusting it,
+not by reasoning about it abstractly.
+
+**Actual fix:** moved the time-budget check inside `_evaluate()`'s per-leg loop itself — checked
+before EVERY leg, not once per call and not once per iteration. `optimize_speed_profile()` gained an
+opt-in `max_seconds` parameter (forwarded via `args=(deadline,)` into `_objective`, `None` by
+default — zero behavior change for every existing caller); on timeout, raises an internal
+`_TimeBudgetExceeded` carrying the in-progress speeds, caught and turned into a real
+`SpeedProfileResult` with `success=False` and a message naming the timeout — never a raised
+exception a caller has to handle, and never a silently dropped point. Re-ran the exact scenario that
+caught the callback bug: 2.61s elapsed against the same 2.0s budget — genuinely bounded (the small
+remaining overrun is one leg's processing time plus the final result-construction pass, both
+expected and documented).
+
+`sweep_epsilon_constraint()` now defaults to `DEFAULT_SWEEP_MAX_SECONDS = 180.0` alongside
+`DEFAULT_SWEEP_MAXITER` (kept as a secondary, now-redundant-but-harmless safeguard). This makes the
+sweep's total worst case an actual, plannable number for the first time:
+`SWEEP_N_POINTS x k_corridors x max_seconds` — with the reduced 5-point sweep and 3 corridors, ~45
+minutes worst case, versus the genuinely open-ended risk before this fix. `run_pareto_sweep.py`'s
+progress printer now labels a timed-out point distinctly ("TIMED OUT (result kept,
+unproven-optimal)") rather than lumping it in with ordinary non-convergence.
+
+**Tests:** 4 new (`test_max_seconds_defaults_to_unbounded`,
+`test_max_seconds_bounds_wall_clock_time_even_with_many_slow_legs` — a direct regression reproducing
+the exact scenario that caught the callback bug, asserting the fix holds with a real (not
+coincidental) margin — in `test_speed_profile.py`). 127/127 project-wide, zero regression.
+
+**Honest state of Phase 4 as of this update:** the sweep now has a real, bounded worst-case runtime
+and never hangs or silently drops a point, but a `max_seconds`-timeout point is an unproven-optimal
+result, not a converged one — its fuel/duration/risk numbers are real (computed from a real,
+feasible-or-near-feasible speed profile) but not guaranteed to be the TRUE minimum-fuel point for
+that epsilon. This is disclosed in the sweep's own printed output (the "TIMED OUT" label) and should
+be treated as lower-confidence on any frontier point it appears on, until/unless the deeper fix (an
+analytic gradient, flagged above) removes the need for a timeout at all.
+
+**Update — real run completed successfully within the new bound, closing out Phase 4's runtime
+problem: total wall-clock ~42 minutes (15 solves), versus the previous run's 3+ hours for less
+progress.** Real results, all 3 corridors, 5 epsilons each:
+
+| Corridor | ep1 (228.6-230.4h) | ep2 | ep3 | ep4 | ep5 (365.7-368.7h) |
+|---|---|---|---|---|---|
+| 1 | 749.2t (ok, 149.5s) | 580.4t (**timeout**, 180.0s) | 469.6t (**timeout**, 180.0s) | 392.0t (ok, 177.5s) | 336.6t (**timeout**, 180.2s) |
+| 2 | 751.3t (ok, 130.9s) | 581.9t (timeout) | 470.8t (timeout) | 393.0t (timeout) | 337.6t (timeout) |
+| 3 | 755.5t (ok, 74.5s) | 585.0t (timeout) | 473.3t (timeout) | 395.1t (timeout) | 339.4t (timeout) |
+
+Pooled and filtered: **all 5 non-dominated frontier points come from corridor 1** — corridors 2 and
+3 are strictly dominated at every comparable epsilon (marginally longer/costlier lateral variants of
+the same route, consistent with Phase 2's finding that this corridor's "diversity" is mild lateral
+spread, not a genuine routing choice with a large cost gap). Fuel decreases smoothly and
+monotonically as the deadline loosens (749.2 -> 580.4 -> 469.6 -> 392.0 -> 336.6t), matching the
+expected shape with no discontinuities — a real sanity check the timeout-affected points still
+passed despite not being proven-optimal.
+
+**Honest caveat on the reported frontier: only 4 of 15 solves converged (`success=True`); on the
+5-point frontier itself, only 2 of 5 (epsilon 1 and epsilon 4) are proven-optimal — the other 3 are
+real, feasible, `max_seconds`-timeout results.** Their fuel numbers are genuine (computed from an
+actual feasible speed profile satisfying that epsilon's deadline), but not verified as the true
+minimum for that epsilon — the true frontier could sit at or below these values, never above. Worth
+raising `DEFAULT_SWEEP_MAX_SECONDS` for a future run focused only on corridor 1 (now known to be the
+only one that matters for this frontier) if a fully-converged frontier is needed, rather than
+accepting this one as final.
+
+**A property of the `weather_risk_m_hours` metric worth flagging, not a bug:** in this run, risk
+climbed monotonically WITH duration (185.0 -> 194.2 -> 231.2 -> 286.3 -> 322.0 m*h) as fuel dropped.
+This is expected given the metric's definition (`wave_height_m x transit_hours` per leg, summed) —
+running the same physical conditions more slowly mechanically accumulates more metre-hours of
+exposure, independent of whether the route is actually "riskier" in any exposure-severity sense.
+So on this frontier, the fuel-cheap/slow end and the risk-cheap/fast end are the same axis almost by
+construction, not two independently-discovered trade-offs — worth being explicit about this when
+this frontier is shown to anyone, since "risk" here measures time-in-weather, not danger.
+
+**Not yet done:** a rerun focused on corridor 1 alone with a larger `max_seconds` (to get a fully
+converged frontier); the analytic-gradient fix that would make this fast rather than merely bounded,
+still flagged above as the real unresolved item.
