@@ -996,3 +996,340 @@ this frontier is shown to anyone, since "risk" here measures time-in-weather, no
 **Not yet done:** a rerun focused on corridor 1 alone with a larger `max_seconds` (to get a fully
 converged frontier); the analytic-gradient fix that would make this fast rather than merely bounded,
 still flagged above as the real unresolved item.
+
+## Phase 4 addendum: severe-weather-hours risk-budget column
+
+Added `severe_weather_hours(result, threshold_m=4.5)` to `pareto.py` as a companion to
+`weather_risk_m_hours` — a threshold-gated metric ("hours spent at/above a stated wave-height
+limit") rather than the continuous metre-hours integral, because that's the shape a commercial risk
+budget / charter-party heavy-weather clause actually asks for. Reads the same per-leg
+`wave_height_m`/`transit_hours` data already in `SpeedProfileResult.legs`, so no new weather
+sampling was needed. Wired through: `ParetoPoint` gained a `severe_weather_hours` field (defaulted
+to 0.0 so existing direct-construction call sites, e.g. `test_pareto.py`'s `_point()` helper, didn't
+need updating), `sweep_epsilon_constraint()` gained a `severe_weather_threshold_m` parameter
+(default `DEFAULT_SEVERE_WAVE_THRESHOLD_M = 4.5`) and now populates the field on every point it
+returns, and `run_pareto_sweep.py`'s CSV writer gained a `severe_weather_hours_ge_4.5m` column. 8 new
+tests added (closed-form threshold checks including the `>=` boundary case, a custom-threshold
+override, and two sweep-integration checks against hand-built rough/mild legs). Full suite: 133
+passed.
+
+**Not yet done — this needs a real rerun to be useful:** the CSV currently checked in
+(`pareto_frontier_rotterdam_ceyhan.csv`) predates this column and has no per-leg wave-height data to
+retroactively compute it from (only aggregate `weather_risk_m_hours` was written out). Getting real
+severe-weather-hours numbers requires rerunning `run_pareto_sweep.py` once (bounded to ~45 min per
+the fix above; the already-known result from the prior run — only corridor 1 survives the frontier,
+2 of 5 points proven-optimal — will likely repeat). Once that rerun produces a CSV with this column,
+a different severe-weather threshold does NOT need a rerun: `df[df["severe_weather_hours_ge_4.5m"]
+<= budget]`-style filtering, or recomputing at a different threshold from the underlying `.legs` data
+if that's ever persisted, both work off the one real run.
+
+## Phase 5 — Airflow-orchestrated batch entry point for the Phase 4 Pareto sweep
+
+Goal: run Phase 4's sweep on a schedule (Airflow) rather than only interactively,
+without duplicating the sweep logic between an Airflow task and the standalone
+script.
+
+**Refactor first, DAG second.** Extracted `scripts/run_pareto_sweep.py`'s `main()`
+into `navi_opt.orchestration.pareto_sweep_task.run_pareto_sweep_task()`, an
+importable function taking a `SweepConfig` dataclass (origin/destination ports,
+cache paths, weather window, every sweep parameter) and returning a `SweepResult`
+(output CSV path + the in-memory `all_points`/`frontier` lists, so a caller isn't
+forced to re-read its own just-written CSV to get them back). The script is now a
+thin wrapper: builds a `SweepConfig` from its existing module-level constants,
+supplies the print-based progress callbacks for interactive use, and catches
+`FileNotFoundError`/`ValueError` to keep printing the same friendly messages it
+always did. The task function itself *raises* those instead of printing-and-
+returning, deliberately — a scheduled run has no one watching stdout to notice a
+silent early return; an Airflow task needs a real exception to mark itself failed.
+8 new tests in `tests/test_pareto_sweep_task.py`, all mocking the four external
+calls (`load_graph`, `load_anchors`, `open_weather_field_remote`,
+`make_weather_lookup`) so they run offline against a trivial two-leg graph —
+solver/sweep/frontier correctness is already covered directly in `test_pareto.py`;
+this file only covers the wiring/I/O this module adds. Full suite: 141 passed.
+
+**Scope decision, made explicit rather than silently deferred:** this is still ONE
+corridor (Rotterdam<->Ceyhan), not a loop over a fleet of routes, even though the
+DAG is titled "batch" and the README's stated ambition is fleet-planning. The
+project has exactly one cached real-weather digraph, built for one specific bbox.
+Looping the new `origin_port`/`destination_port` parameters over hardcoded port
+pairs would silently pretend to support fleet planning while actually routing
+every "different" pair across a graph that was never built to cover them — worse
+than not doing it, since it would look like progress on the stated goal while
+being wrong. A real fleet batch needs either a much larger shared ocean grid or a
+per-route graph-building step first; documented here so this isn't rediscovered
+as an oversight later, same pattern used throughout this project for scope calls
+like this.
+
+**Airflow needs its own image — not the stock `apache/airflow`.** Traced every
+`import`/`from` transitively reachable from `run_pareto_sweep_task()` (through
+`graph_builder.py`, `port_anchors.py`, `pareto.py`, `speed_profile.py`,
+`k_shortest.py`, `vessel_profiles.py`, `weather_field.py`, `cmems_client.py`) to
+build a deliberately NARROWER pip requirements list than `environment.yml`
+(`infra/airflow/requirements.txt`): numpy, scipy, pandas, pyarrow (the
+`pd.read_parquet` engine `port_anchors.py`'s cache format needs — easy to miss,
+not obvious from `environment.yml` since conda's pandas build bundles a working
+parquet engine differently than a bare pip install does), networkx, shapely,
+pyproj, h3, PyYAML, xarray, copernicusmarine. Left out on purpose: geopandas,
+netcdf4/h5netcdf (only needed by the local-file weather path this task doesn't
+use — it calls `open_weather_field_remote()`, the zarr/streaming path),
+matplotlib/ortools/pyomo/fastapi/uvicorn/streamlit/plotly/pytest/confluent-kafka
+(other phases' or the interactive/dashboard side's problem, not this image's).
+`infra/airflow/Dockerfile` builds `apache/airflow:2.9.3-python3.11` (matching this
+project's Python 3.11 requirement — the stock tag defaults to 3.8) plus this
+requirements file. `docker-compose.yml`'s `x-airflow-common` now has `build:` +
+a shared `image:` tag (so all three Airflow services build once, not three times),
+`env_file: ../.env` (the SAME .env the standalone scripts already use — so CMEMS
+credentials reach the containers without duplicating them into the compose file),
+`PYTHONPATH: /opt/airflow/src` (same "point at `src/` instead of pip-installing
+the package" convention `pyproject.toml`'s `pythonpath = ["src"]` already uses for
+pytest), and two new volume mounts (`../config`, `../data` as siblings of
+`../src` inside the container) — required because `vessel_profiles.py` /
+`port_anchors.py` / `graph_builder.py` all resolve their config/cache paths as
+`Path(__file__).resolve().parents[N] / "config"|"data"`, relative to their own
+location under `src/`, unchanged from local execution.
+
+**Not yet verified — flagged plainly, not glossed over:** none of this (image
+build, DAG load, real task execution) has been run against a real Airflow
+instance from the sandbox that wrote it — no Docker there. The `apache/airflow
+:2.9.3-python3.11` tag's exact existence, whether `pip install`ing this
+requirements list into that base image actually succeeds without a missing
+system library (geopandas-adjacent packages have historically needed system GDAL
+on Debian-slim bases; this list avoids geopandas specifically to sidestep that,
+but copernicusmarine's own transitive deps haven't been verified against a slim
+base either), and whether the DAG actually loads and runs correctly in a real
+Airflow scheduler — all real open questions, called out in both the Dockerfile's
+and the DAG's own docstrings, to be resolved by an actual `docker compose up -d
+--build` + a real triggered DAG run, not assumed working from this sandbox.
+
+**Deliberate design choices worth flagging for a reader, not just a note to
+self:** the DAG names each run's output CSV with Airflow's own `ds` (execution
+date) rather than overwriting one well-known path — a scheduled batch job's whole
+point is keeping every run's output around to compare, unlike the interactive
+script (which is fine overwriting the same file on repeated manual runs).
+`retries=0` and `execution_timeout=60min` on the DAG's `default_args` are also
+deliberate: a naive `retries=1` would silently double the real cost of a
+transient CMEMS hiccup (another ~45 minutes) with no better odds of success, so
+this fails loudly instead and leaves re-triggering to a person's judgment; the
+60-minute timeout is a safety net just above the sweep's own known ~45-minute
+worst case, not an arbitrary round number.
+
+**Not yet done:** Phase 6 (Kafka event-driven reoptimization) — the actual next
+piece the README's stated architecture calls for; a genuine multi-route fleet
+loop (needs the bigger-ocean-grid-or-per-route-graph decision above first); and
+pushing results into Postgres instead of/alongside a CSV, which stays out for now
+specifically to avoid mixing domain data into Airflow's own metadata database
+without a real schema decision behind it.
+
+## Phase 5 correction — the requirements.txt trace missed a real transitive dependency
+
+First real `docker compose up -d --build` + DAG load on the user's actual machine
+caught something this sandbox couldn't: `pareto_sweep_dag.py` failed to load with
+`ModuleNotFoundError: No module named 'geopandas'`, traced to
+`graph_builder.py -> h3_ocean_grid.py -> land_mask.py -> import geopandas`.
+
+The root cause was a mistake in how the original dependency trace was done, not an
+environment difference: the `grep` used to find `navi_opt`'s import chain
+explicitly *excluded* any line matching `navi_opt\.` — meaning it only ever
+looked at third-party imports, never followed navi_opt-internal imports to see
+what THEY pulled in transitively. `graph_builder.py` imports
+`navi_opt.grid.h3_ocean_grid` (for `cell_centroid`/`neighbors`, used inside
+`load_graph()`'s dependents elsewhere in that file) and `navi_opt.grid.land_mask`
+directly, and `h3_ocean_grid.py` itself imports `land_mask.py` — so importing
+`graph_builder.py` at all executes `land_mask.py`'s `import geopandas as gpd`,
+regardless of whether `load_graph()` (the only function the sweep task actually
+calls) ever exercises any land-masking logic. Python has no lazy-import-by-default
+behavior; a module-level import runs at import time, full stop — the original
+trace's reasoning ("only needed by the land-masking path this task doesn't use")
+was simply wrong about how Python import execution works, not about what
+`load_graph()` does at runtime.
+
+Redid the trace properly with an AST walk (`ast.walk` over every file's
+`Import`/`ImportFrom` nodes, following `navi_opt`-internal imports recursively)
+instead of eyeballing grep output, and found a second real miss the same way:
+`land_mask.py` also imports `navi_opt.grid.download_natural_earth`, which imports
+`requests` — three hops down, easy to miss by inspection, not by an automated
+walk. Both added to `infra/airflow/requirements.txt` with the actual import
+chain documented in-line.
+
+**Lesson for future dependency tracing in this project:** grep-based "what does
+this import" checks are only trustworthy for direct, single-file imports;
+anything crossing a module boundary needs either an automated transitive walk or
+an actual import attempt in the target environment — this is exactly the gap
+between "looks right on inspection" and "confirmed by running it" this project's
+`findings.md` has flagged before (Phase 4's sweep timing, Phase 1's Windows HDF5
+conflict) and now again here. The image otherwise built and ran cleanly on the
+first real attempt — the base image tag, the rest of the dependency list, the
+`env_file`/`PYTHONPATH`/volume-mount wiring in `docker-compose.yml`, and the six
+containers coming up healthy all worked as designed; this was the one real gap.
+
+## Phase 6 — Kafka event-driven reoptimization
+
+**What this closes:** the README's stated architecture always named Kafka as
+the event-driven layer sitting alongside Airflow's batch layer; Phase 6 builds
+it — a voyage departs, its state is tracked in-process, real CMEMS weather is
+polled on a schedule, and a meaningful forecast change on an edge still ahead
+of a tracked voyage triggers a real bounded re-solve of that voyage's remaining
+legs, publishing the before/after result.
+
+**Two scope decisions made explicit up front, both taken from the recommended
+option when asked (see the two `AskUserQuestion` calls that kicked this phase
+off), not defaulted to silently:**
+
+1. **Real polling against live CMEMS, not synthetic weather events.** The
+   producer (`weather_producer.py`) does a genuine `open_weather_field_remote()`
+   fetch on every poll and diffs it against the previous poll's sample — no
+   synthetic "inject an event" test harness stands in for this. The trade-off,
+   stated plainly: every poll costs a real network round-trip and CMEMS forecast
+   revisions are not sub-hourly, so `DEFAULT_POLL_INTERVAL_SECONDS = 3600.0` is
+   the honest default, with a documented `--poll-interval-seconds` override for
+   demoing without a real hour's wait.
+2. **In-memory voyage state in the consumer process, not Postgres-backed.**
+   `VoyageRegistry` is a plain in-process dict — the simplest real
+   implementation, explicitly not durable. Restart the consumer and every
+   registered voyage's state (beyond its original departure, which IS
+   replayable — see below) is gone. A Postgres-backed registry is a real,
+   deferred option, not built now because it's premature durability/schema
+   design before the core reoptimization logic itself was proven.
+
+**The three-clock model (`voyage_registry.py`) — the one genuinely new design
+problem this phase had to solve.** A voyage's weather sampling needs the SAME
+absolute calendar reference every `optimize_speed_profile()` call in this
+project has always used (`voyage_start_time`, fixed to whatever historical/
+forecast CMEMS window was fetched — June 2024 throughout this project). But
+"how far along is this voyage right now" needs some notion of elapsed real time
+to progress at all within a demo session that runs minutes, not the
+~230–410 real hours findings.md's Phase 4 entries measured for the actual
+corridor. Conflating those two clocks would be wrong — real "now" in 2026 has
+no meaningful relationship to a fixed 2024 CMEMS window. So a third, explicit
+clock exists: `demo_departed_at` (the real wall-clock moment a voyage was
+registered), scaled by `DEMO_TIME_SCALE = 600.0` (one real minute = 10
+simulated voyage hours) into voyage-timeline hours via `elapsed_hours()`. This
+is openly a demo acceleration mechanic, not a claim about real voyage
+tracking — a real deployment would replace `elapsed_hours()`'s wall-clock
+computation with real AIS/position-report data and drop the demo clock
+entirely; `DEMO_TIME_SCALE` exists specifically to keep that swap legible as a
+placeholder, not to quietly ship as if it were real position tracking.
+
+**Event-as-trigger, not event-as-ground-truth (`reoptimization_consumer.py`).**
+`handle_weather_update()` deliberately does NOT reoptimize against the
+`WeatherUpdateEvent`'s own embedded previous/new wave-height values — those
+exist to decide *whether* to react, not what to solve against. The actual
+reoptimization always uses a freshly-built `weather_lookup` the caller
+constructed for that event (a real `open_weather_field_remote()` +
+`make_weather_lookup()` pair — see `run_reoptimization_consumer.py`'s main
+loop). A real event-driven system re-derives the truth it acts on rather than
+trusting a notification payload for a decision with real solver cost attached
+(a 180s-bounded solve per affected voyage, `reoptimizer.
+DEFAULT_REOPTIMIZE_MAX_SECONDS` — same bounded-solve reasoning as
+`pareto.py`'s sweep budget, reused rather than re-derived since a live
+reoptimization is if anything more time-sensitive than a batch sweep point).
+
+**Decoupled producer, by design, not by oversight (`weather_producer.py`).**
+The producer has no knowledge of `VoyageRegistry` or any specific voyage's
+schedule — it samples every edge of the cached digraph at a single fixed
+reference time (`elapsed_hours=0`, i.e. "what would a voyage departing right
+now see"), which is a real, defensible proxy for "has the forecast changed"
+(CMEMS forecasts genuinely do get revised for the same target dates as new
+observations arrive), not a claim that it tracks every voyage's own per-leg
+scheduled time. Producers and consumers being mutually unaware of each other's
+internal state is Kafka's whole point, not a gap to close; a more complete
+system sampling at each active voyage's own scheduled time is a real,
+documented architecture change for later, not implemented here.
+
+**Warm-starting preserved across reoptimizations.** `reoptimize_voyage()`
+warm-starts SLSQP from the committed profile's remaining-leg speeds — same
+"the previous solution is typically close to the next one" reasoning already
+used for `sweep_epsilon_constraint()`'s own warm start (see the Phase 4 timing
+entry above), now applied to a live re-solve rather than a sweep point.
+
+**Already-late handling, not swallowed.** If a voyage's elapsed time already
+exceeds its original deadline by the time a reoptimization fires (e.g. after a
+prior reoptimization already used up all the slack), `reoptimize_voyage()`
+does not clamp to zero (would misrepresent "immediate arrival required" as a
+real constraint) or raise (a late voyage still needs a best-effort profile,
+arguably more urgently than an on-time one) — it drops the deadline constraint
+for that one solve and returns the optimizer's unconstrained-fuel-minimizing
+profile, leaving "this came back already-late" as a signal the caller can act
+on (an alert, a flagged event), not something this function decides how to
+react to.
+
+**Plain JSON over the wire, not Avro/a schema registry** — `serialization.py`
+recurses `SpeedProfileResult`/`LegResult` (both `typing.NamedTuple`s) into
+plain dicts via `._asdict()`; the two event dataclasses
+(`WeatherUpdateEvent`, `ReoptimizationResultEvent`) are already flat enough for
+`dataclasses.asdict()` directly. Same "don't add complexity a problem this
+size doesn't need" standard this project has applied before (`pareto_frontier
+()`'s O(n²) filter, the STRtree/joblib non-decision in Phase 2) — a
+single-node demo Kafka cluster with a handful of message types doesn't need
+schema evolution machinery, and plain JSON is directly inspectable in Kafka UI
+(already running per `infra/docker-compose.yml`), which matters for a project
+meant to be demoed and read.
+
+**Restart-survives-partially, documented rather than silently gapped
+(`run_reoptimization_consumer.py`).** In-memory state means a naive restart
+loses every registered voyage. The consumer mitigates this by replaying
+`voyage-events` from the earliest offset on startup (`_consume_departure_
+backlog()`) to rebuild the registry before joining the live loop —
+`weather-updates` is read live only (`latest`), since replaying old weather
+diffs on every restart would just re-trigger reoptimizations already handled.
+This is a real but partial fix: a voyage's REOPTIMIZED profile is never itself
+republished to `voyage-events`, so a restart mid-voyage rebuilds each voyage
+from its ORIGINAL departed profile, not its latest reoptimized one. Closing
+that gap properly means either also replaying `reoptimization-results` (last
+result wins) or the Postgres-backed registry this phase already scoped out —
+left open here, stated plainly, not silently masked by the backlog replay
+looking like full durability when it isn't.
+
+**Module layout, mirroring the reasoning in each module's own docstring:**
+`serialization.py` (JSON round-trips) → `voyage_registry.py` (what a voyage
+IS, the three-clock model) → `reoptimizer.py` (the one piece with real
+mathematical content — a bounded, warm-started `optimize_speed_profile()`
+call, independently unit-testable against a real solve on a tiny graph) →
+`weather_producer.py` (the polling loop's pure diff logic, `poll_once()`'s
+real-fetch glue kept thin and untested from this sandbox) →
+`reoptimization_consumer.py` (message-handling logic, pure functions taking
+already-parsed dicts and a registry — no Kafka client inside it, same
+network-glue-stays-thin pattern). Three CLI scripts
+(`depart_demo_voyage.py`, `run_weather_producer.py`,
+`run_reoptimization_consumer.py`) wire the pure modules to real
+`confluent_kafka.Producer`/`Consumer` instances and the real Kafka broker from
+`infra/docker-compose.yml`.
+
+**Tests:** 21 new tests across the five streaming modules (5 serialization, 14
+voyage_registry, 7 reoptimizer, 9 weather_producer, 7 reoptimization_consumer
+— 42 total; some already covered in earlier entries this session before the
+consumer module existed), all offline: `reoptimizer.py`'s tests run a real
+`optimize_speed_profile()` solve on a small synthetic graph (same "real solver
+call on a tiny fake graph, not mocked" standard as `test_pareto.py`/
+`test_pareto_sweep_task.py`); everything network/Kafka-facing
+(`weather_producer.poll_once()`'s real fetch, and the three CLI scripts' real
+`Producer`/`Consumer` loops) is deliberately kept thin and untested from this
+sandbox — same "the decision logic underneath is fully covered, the glue
+needs a real broker/network to exercise" split as every earlier phase's
+network-facing code. Project-wide: 183/183 passing, zero regression.
+
+**Not yet verified — flagged plainly, not glossed over:** none of Phase 6 has
+been run against the user's real, already-running Kafka broker or real CMEMS
+from the sandbox that wrote it — no network route to either from here. Whether
+`confluent-kafka` (already in `environment.yml`, so likely no new Docker image
+needed the way Airflow required one — but not yet confirmed) actually connects
+cleanly to the KRaft-mode broker at `localhost:9092`, whether a real
+`depart_demo_voyage.py` run solves and publishes correctly, whether
+`run_weather_producer.py` actually detects a real forecast revision within a
+reasonable demo session, and whether `run_reoptimization_consumer.py`'s
+backlog-replay and live dispatch loop behave correctly end-to-end against the
+real broker — all real open questions for the user's machine to answer, the
+same "read the printed output before trusting it" discipline every prior
+phase's first real run has needed.
+
+**Not yet done:** a genuine multi-voyage / multi-corridor fleet demo (nothing
+in Phase 6 prevents running `depart_demo_voyage.py` multiple times with
+distinct `--voyage-id`s, but it hasn't been exercised); pushing
+`reoptimization-results` anywhere durable beyond the Kafka topic itself (a
+dashboard, Postgres) — out of scope for the reasoning above; the fixed June
+2024 CMEMS window means `run_weather_producer.py` polls the same historical
+forecast repeatedly rather than a genuinely live-updating one — real forecast
+revisions for a fixed past window are far rarer than for a live near-term
+window, so a demo may see few or no real weather-update events without either
+a longer observation period or (a real option, not implemented) shifting the
+polled window to something closer to "now" specifically to see live revisions.
