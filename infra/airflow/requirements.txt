@@ -1,0 +1,52 @@
+# Pip requirements for the custom Airflow image (infra/airflow/Dockerfile),
+# NOT a copy of the project's conda environment.yml. This is deliberately a
+# narrower list: only what
+# `navi_opt.orchestration.pareto_sweep_task.run_pareto_sweep_task()`'s own
+# import chain actually needs to run inside the Airflow containers.
+#
+# First-pass tracing mistake, corrected here rather than quietly: an
+# earlier version of this file left geopandas and requests off, reasoning
+# that `load_graph()` never calls the land-masking / Natural-Earth-download
+# functions that need them. That reasoning was wrong — Python executes
+# every top-level import in a module the moment it's imported, whichever
+# function you actually call, so `graph_builder.py` importing
+# `h3_ocean_grid.py` (which imports `land_mask.py`, which imports
+# geopandas and, three hops down, `download_natural_earth.py`, which
+# imports requests) makes both unavoidable just to import graph_builder.py
+# at all — confirmed the hard way: the DAG failed to load in a real
+# Airflow instance with `ModuleNotFoundError: No module named 'geopandas'`
+# on exactly that chain (see Phase 5's findings.md entry). Left out on
+# purpose, and still believed correct after that miss (these genuinely
+# aren't imported by anything in the real chain, traced with an AST walk
+# this time, not eyeballed): netcdf4, h5netcdf (only the local-file
+# weather path this task doesn't use needs those — it calls
+# open_weather_field_remote(), the zarr/streaming path), matplotlib,
+# ortools, pyomo, fastapi, uvicorn, streamlit, plotly, pytest,
+# confluent-kafka (Phase 6's problem, not this image's).
+#
+# Still not fully verified end-to-end from the sandbox that wrote this (no
+# Docker there) — geopandas' own transitive deps (pyogrio/fiona) on a
+# Debian-slim base is the next likeliest place for another surprise;
+# confirm the DAG actually loads without an import error in the real
+# Airflow UI after this change before trusting the list is complete.
+
+numpy
+scipy
+pandas
+pyarrow          # pd.read_parquet's engine — port_anchors.py's cache format
+networkx
+shapely
+pyproj
+h3
+geopandas        # land_mask.py — imported transitively via graph_builder.py -> h3_ocean_grid.py
+requests         # download_natural_earth.py — imported transitively via land_mask.py
+PyYAML           # vessel_profiles.py reads config/vessel_profiles.yaml
+xarray
+copernicusmarine # pulls in its own zarr/fsspec/s3fs stack for the remote-streaming path
+
+# python-dotenv is NOT listed here on purpose: inside the Airflow containers,
+# CMEMS credentials arrive as real container environment variables via
+# docker-compose.yml's `env_file: ../.env` on x-airflow-common, so there's
+# no .env file to load_dotenv() from in-container the way the standalone
+# scripts do — copernicusmarine reads COPERNICUSMARINE_SERVICE_USERNAME/
+# _PASSWORD straight from os.environ either way.

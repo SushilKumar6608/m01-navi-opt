@@ -1,18 +1,50 @@
 name: m01-navi-opt
 
 x-airflow-common: &airflow-common
-  image: apache/airflow:2.9.3
+  # `image:` alongside `build:` so all three services sharing this anchor
+  # (airflow-init, airflow-webserver, airflow-scheduler) resolve to the
+  # SAME built image and tag rather than each triggering its own build —
+  # compose builds once for the first service that needs it and reuses
+  # the tag for the rest.
+  image: m01-navi-opt-airflow:latest
+  build:
+    context: ./airflow
+    dockerfile: Dockerfile
+  # Phase 5: env_file (not just `environment:`) so the SAME .env the
+  # standalone scripts already use for COPERNICUSMARINE_SERVICE_USERNAME/
+  # _PASSWORD also reaches the Airflow containers, without duplicating
+  # those values into this compose file. Path is relative to this file
+  # (infra/docker-compose.yml), i.e. the project root's .env — copy
+  # .env.example to .env there first if you haven't (see README).
+  env_file:
+    - ../.env
   environment:
     AIRFLOW__CORE__EXECUTOR: LocalExecutor
     AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
     AIRFLOW__CORE__LOAD_EXAMPLES: "false"
     AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
     AIRFLOW__WEBSERVER__EXPOSE_CONFIG: "true"
+    # Lets `infra/airflow/dags/*.py` do `from navi_opt.orchestration...`
+    # against the bind-mounted ../src below without installing the
+    # navi_opt package into the image — the same "point PYTHONPATH at
+    # src/ instead of pip-installing" convention pyproject.toml's
+    # `pythonpath = ["src"]` already uses for pytest.
+    PYTHONPATH: /opt/airflow/src
   volumes:
     - ./airflow/dags:/opt/airflow/dags
     - ./airflow/logs:/opt/airflow/logs
     - ./airflow/plugins:/opt/airflow/plugins
     - ../src:/opt/airflow/src
+    # config/ and data/ are mounted as siblings of src/ inside the
+    # container (i.e. at /opt/airflow/config, /opt/airflow/data) because
+    # vessel_profiles.py, port_anchors.py, and graph_builder.py all
+    # resolve their cache/config paths as `Path(__file__).resolve()
+    # .parents[N] / "config"|"data"` relative to their own location under
+    # src/ — the same repo-root-relative convention already used when
+    # these modules run locally, unchanged here, not a container-specific
+    # special case.
+    - ../config:/opt/airflow/config
+    - ../data:/opt/airflow/data
   depends_on:
     postgres:
       condition: service_healthy

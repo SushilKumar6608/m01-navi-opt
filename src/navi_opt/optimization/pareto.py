@@ -33,6 +33,15 @@ briefly. A per-leg-maximum ("worst single leg") metric is a legitimate
 alternative for a different question ("what's the single worst moment"),
 not implemented here — documented so this choice doesn't get
 rediscovered as an oversight later.
+
+A second, threshold-gated weather metric — `severe_weather_hours()`,
+hours spent at/above a stated wave-height threshold (default 4.5m) — is
+also computed per point, for the different question a commercial risk
+budget actually asks ("how many hours in conditions past our stated
+limit", not "what's the continuous exposure integral"). See its own
+docstring for why this is a separate function rather than a parameter on
+`weather_risk_m_hours()`: the two answer different questions and a
+caller may want either or both.
 """
 from __future__ import annotations
 
@@ -56,6 +65,46 @@ def weather_risk_m_hours(result: SpeedProfileResult) -> float:
     return sum(leg.wave_height_m * leg.transit_hours for leg in result.legs)
 
 
+#: Default significant-wave-height threshold (metres) used by
+#: `severe_weather_hours()` below when the caller doesn't specify one.
+#: 4.5m is a commonly-cited operational threshold for MR-tanker-class
+#: heavy-weather concern, chosen here as a reasonable default for
+#: commercial risk-budget reporting — NOT derived from this project's
+#: vessel/resistance model, and any caller with a specific charter-party
+#: or cargo-class threshold in mind should pass it explicitly rather than
+#: rely on this default.
+DEFAULT_SEVERE_WAVE_THRESHOLD_M = 4.5
+
+
+def severe_weather_hours(
+    result: SpeedProfileResult, threshold_m: float = DEFAULT_SEVERE_WAVE_THRESHOLD_M
+) -> float:
+    """Total transit hours spent on legs whose sampled significant wave
+    height is at or above `threshold_m` metres, for one already-solved
+    speed profile.
+
+    A companion, threshold-gated metric to `weather_risk_m_hours()` above
+    (see its docstring for the continuous, time-weighted version): where
+    `weather_risk_m_hours` answers "how much wave-height exposure did this
+    route accumulate", this answers the operationally different question
+    "how many hours did this route spend in conditions a specific policy
+    (a charter party's heavy-weather clause, a cargo class's stated
+    limit) would flag as severe" — a step function of wave height rather
+    than a continuous weighting, deliberately, because that's how such
+    policies are actually written (a clause triggers past a stated
+    threshold, not proportionally below it). Reads the same per-leg
+    `wave_height_m`/`transit_hours` `SpeedProfileResult.legs` data that
+    `weather_risk_m_hours` does, so this needs no new weather sampling
+    either — just a different reduction over the same samples.
+
+    A leg that meets the threshold is counted in FULL, not partially by
+    how far over — the optimizer samples one wave height per leg (not a
+    sub-leg profile), so there's no finer resolution to apportion within
+    a leg.
+    """
+    return sum(leg.transit_hours for leg in result.legs if leg.wave_height_m >= threshold_m)
+
+
 class ParetoPoint(NamedTuple):
     corridor_index: int
     epsilon_hours: float  # the max_transit_hours cap used to produce this point
@@ -64,6 +113,12 @@ class ParetoPoint(NamedTuple):
     weather_risk_m_hours: float
     success: bool
     result: SpeedProfileResult
+    #: Hours spent at/above `DEFAULT_SEVERE_WAVE_THRESHOLD_M` (or whatever
+    #: threshold the caller used) — see `severe_weather_hours()`. Defaults
+    #: to 0.0 so existing callers that construct a ParetoPoint directly
+    #: (e.g. tests exercising pure dominance logic, which don't care about
+    #: this field) don't need updating.
+    severe_weather_hours: float = 0.0
 
 
 #: Default SLSQP iteration cap passed to `optimize_speed_profile()` by
@@ -107,6 +162,7 @@ def sweep_epsilon_constraint(
     maxiter: Optional[int] = DEFAULT_SWEEP_MAXITER,
     max_seconds: Optional[float] = DEFAULT_SWEEP_MAX_SECONDS,
     on_progress: Optional[ProgressCallback] = None,
+    severe_weather_threshold_m: float = DEFAULT_SEVERE_WAVE_THRESHOLD_M,
 ) -> List[ParetoPoint]:
     """Runs `optimize_speed_profile()` once per epsilon in `epsilons_hours`
     for ONE fixed corridor, each with `max_transit_hours=epsilon`. Skips
@@ -130,6 +186,11 @@ def sweep_epsilon_constraint(
     after a live run looked indistinguishable from a hang — see
     findings.md). Optional and side-effect-only: omitting it changes
     nothing about this function's return value.
+
+    `severe_weather_threshold_m` is forwarded to `severe_weather_hours()`
+    for every feasible point's `severe_weather_hours` field — override it
+    if the caller's risk policy uses a threshold other than
+    `DEFAULT_SEVERE_WAVE_THRESHOLD_M`.
 
     Warm-starting: each epsilon after the first is solved starting from the
     PREVIOUS feasible epsilon's converged speeds (`initial_speeds_knots`),
@@ -180,6 +241,7 @@ def sweep_epsilon_constraint(
                 weather_risk_m_hours=weather_risk_m_hours(result),
                 success=result.success,
                 result=result,
+                severe_weather_hours=severe_weather_hours(result, severe_weather_threshold_m),
             )
             points.append(point)
             # Only warm-start the NEXT epsilon from a solve that actually

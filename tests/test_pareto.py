@@ -2,10 +2,12 @@ import networkx as nx
 import pytest
 
 from navi_opt.optimization.pareto import (
+    DEFAULT_SEVERE_WAVE_THRESHOLD_M,
     DEFAULT_SWEEP_MAXITER,
     ParetoPoint,
     default_epsilon_sweep,
     pareto_frontier,
+    severe_weather_hours,
     sweep_epsilon_constraint,
     weather_risk_m_hours,
 )
@@ -80,6 +82,40 @@ def test_weather_risk_is_sum_of_wave_height_times_transit_hours():
 def test_weather_risk_is_zero_for_calm_water():
     legs = [_fake_leg(0.0, 10.0), _fake_leg(0.0, 5.0)]
     assert weather_risk_m_hours(_fake_result(legs)) == pytest.approx(0.0)
+
+
+# --- severe_weather_hours: closed-form check against hand-built legs ---
+
+
+def test_severe_weather_hours_sums_only_legs_at_or_above_threshold():
+    legs = [
+        _fake_leg(5.0, 10.0),  # at/above default 4.5m threshold -> counted in full
+        _fake_leg(4.5, 8.0),   # exactly at threshold -> counted (>=, not >)
+        _fake_leg(3.0, 20.0),  # below threshold -> not counted
+        _fake_leg(0.0, 5.0),   # calm -> not counted
+    ]
+    result = _fake_result(legs)
+    assert severe_weather_hours(result) == pytest.approx(10.0 + 8.0)
+
+
+def test_severe_weather_hours_is_zero_when_no_leg_meets_threshold():
+    legs = [_fake_leg(1.0, 10.0), _fake_leg(4.4, 20.0)]
+    assert severe_weather_hours(_fake_result(legs)) == pytest.approx(0.0)
+
+
+def test_severe_weather_hours_respects_a_caller_supplied_threshold():
+    legs = [_fake_leg(2.0, 10.0), _fake_leg(3.0, 5.0)]
+    result = _fake_result(legs)
+    # Default 4.5m threshold: neither leg qualifies.
+    assert severe_weather_hours(result) == pytest.approx(0.0)
+    # Lowered to 2.0m: both legs qualify (>=).
+    assert severe_weather_hours(result, threshold_m=2.0) == pytest.approx(15.0)
+    # Raised above both: nothing qualifies.
+    assert severe_weather_hours(result, threshold_m=10.0) == pytest.approx(0.0)
+
+
+def test_default_severe_wave_threshold_is_positive():
+    assert DEFAULT_SEVERE_WAVE_THRESHOLD_M > 0
 
 
 # --- default_epsilon_sweep: closed-form floor and spacing ---
@@ -323,3 +359,54 @@ def test_sweep_and_frontier_compose_on_a_weather_varying_corridor():
     for p in points:
         rough_leg = next(leg for leg in p.result.legs if (leg.u, leg.v) == ("B", "C"))
         assert p.weather_risk_m_hours == pytest.approx(rough_leg.wave_height_m * rough_leg.transit_hours)
+
+    # The rough leg's wave height (4.0m) is below the default 4.5m severe
+    # threshold, so severe_weather_hours should be 0 for every point here —
+    # a direct check that the sweep actually wires severe_weather_hours()
+    # through (not just weather_risk_m_hours), using the same threshold
+    # boundary case exercised directly above.
+    for p in points:
+        assert p.severe_weather_hours == pytest.approx(0.0)
+
+
+def test_sweep_wires_severe_weather_hours_through_for_a_corridor_above_threshold():
+    g = _two_leg_graph(150.0)
+
+    # Leg B->C now exceeds the default 4.5m severe threshold.
+    def severe_second_leg(u, v, t):
+        if (u, v) == ("B", "C"):
+            return 6.0, 20.0
+        return 0.0, 0.0
+
+    epsilons = default_epsilon_sweep(["A", "B", "C"], g, v_max_knots=HI, n_points=4, max_margin=1.6)
+    points = sweep_epsilon_constraint(
+        0, ["A", "B", "C"], g, VESSEL, "laden", severe_second_leg, epsilons
+    )
+    assert len(points) >= 1
+    for p in points:
+        rough_leg = next(leg for leg in p.result.legs if (leg.u, leg.v) == ("B", "C"))
+        assert p.severe_weather_hours == pytest.approx(rough_leg.transit_hours)
+
+
+def test_sweep_forwards_a_custom_severe_weather_threshold():
+    g = _two_leg_graph(150.0)
+
+    def mild_second_leg(u, v, t):
+        if (u, v) == ("B", "C"):
+            return 2.0, 20.0  # below the default 4.5m threshold...
+        return 0.0, 0.0
+
+    epsilons = default_epsilon_sweep(["A", "B", "C"], g, v_max_knots=HI, n_points=3, max_margin=1.5)
+    default_points = sweep_epsilon_constraint(
+        0, ["A", "B", "C"], g, VESSEL, "laden", mild_second_leg, epsilons
+    )
+    assert all(p.severe_weather_hours == pytest.approx(0.0) for p in default_points)
+
+    # ...but qualifies once the caller lowers the threshold to 2.0m.
+    lowered_points = sweep_epsilon_constraint(
+        0, ["A", "B", "C"], g, VESSEL, "laden", mild_second_leg, epsilons,
+        severe_weather_threshold_m=2.0,
+    )
+    for p in lowered_points:
+        rough_leg = next(leg for leg in p.result.legs if (leg.u, leg.v) == ("B", "C"))
+        assert p.severe_weather_hours == pytest.approx(rough_leg.transit_hours)
