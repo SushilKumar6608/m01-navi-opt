@@ -57,7 +57,8 @@ m01-navi-opt/
 │   ├── run_pareto_sweep.py
 │   ├── depart_demo_voyage.py          # Phase 6: solves + publishes one voyage's initial profile
 │   ├── run_weather_producer.py        # Phase 6: polls real CMEMS, publishes weather-change events
-│   └── run_reoptimization_consumer.py # Phase 6: tracks voyages, reoptimizes on weather events
+│   ├── run_reoptimization_consumer.py # Phase 6: tracks voyages, reoptimizes on weather events
+│   └── inject_weather_event.py        # Phase 6: labelled test event for demos
 ├── tests/
 ├── notebooks/
 ├── environment.yml             # conda environment spec (confluent-kafka already included)
@@ -138,6 +139,11 @@ forecast has meaningfully revised:
 ```
 python scripts/run_weather_producer.py --poll-interval-seconds 60
 ```
+
+The June 2024 weather window rarely revises, so to exercise the path without
+waiting, `python scripts/inject_weather_event.py` publishes one clearly labelled
+test event on an edge still ahead of the voyage (it proves the plumbing, not that
+the optimizer reacts to a storm — see `findings.md`).
 
 When a weather-update event lands on an edge still ahead of a departed voyage,
 the consumer re-fetches real weather and reoptimizes that voyage's remaining

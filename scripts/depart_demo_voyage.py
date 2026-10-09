@@ -47,6 +47,10 @@ from navi_opt.grid.graph_builder import load_graph  # noqa: E402
 from navi_opt.grid.port_anchors import load_anchors  # noqa: E402
 from navi_opt.optimization.speed_profile import optimize_speed_profile  # noqa: E402
 from navi_opt.routing.k_shortest import YenKShortestPaths  # noqa: E402
+from navi_opt.streaming.reoptimizer import (  # noqa: E402
+    DEFAULT_REOPTIMIZE_MAXITER,
+    DEFAULT_REOPTIMIZE_MAX_SECONDS,
+)
 from navi_opt.streaming.serialization import speed_profile_result_to_dict  # noqa: E402
 from navi_opt.weather.vessel_profiles import load_vessel_profile  # noqa: E402
 from navi_opt.weather.weather_field import make_weather_lookup, open_weather_field_remote  # noqa: E402
@@ -140,9 +144,15 @@ def main() -> None:
           f"({len(path)} nodes, deadline {deadline_hours:.1f}h = "
           f"{args.deadline_margin:g}x the {floor_hours:.1f}h flat-out floor)...")
     vessel = load_vessel_profile(VESSEL_KEY)
+    # Bounded, same as every other solve on this corridor: an unbounded
+    # SLSQP run over ~390 legs was measured at 217s to 32+ minutes in
+    # Phase 4 (see findings.md), so this reuses the reoptimizer's budget
+    # rather than leaving the first solve open-ended. A timed-out result
+    # is still a real, usable profile (unproven-optimal), not a failure.
     profile = optimize_speed_profile(
         path, digraph, vessel, CARGO_CONDITION,
         weather_lookup=weather_lookup, start_time_hours=0.0, max_transit_hours=deadline_hours,
+        maxiter=DEFAULT_REOPTIMIZE_MAXITER, max_seconds=DEFAULT_REOPTIMIZE_MAX_SECONDS,
     )
     if not profile.success:
         print(f"   Solve did not converge cleanly ({profile.message}) — "

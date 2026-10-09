@@ -170,6 +170,34 @@ def test_handle_weather_update_reflects_fuel_and_transit_deltas():
     assert result.committed_profile["path"] == ["B", "C", "D"]
 
 
+def test_old_remaining_fields_compare_like_for_like_not_against_the_whole_voyage():
+    # Regression for the first real run: "369.7 -> 235.5t" compared a whole
+    # voyage against only its remaining legs and read like a 36% saving.
+    g = _three_leg_graph(120.0)
+    floor_leg_hours = 120.0 / HI
+    deadline = floor_leg_hours * 3 * 1.8
+    reg = VoyageRegistry()
+    voyage = handle_voyage_departed(reg, _departed_payload(g, deadline_hours=deadline))
+    old_profile = voyage.committed_profile
+
+    leg_ab = old_profile.legs[0]
+    now = _now_at_elapsed_hours(leg_ab.departure_time_hours + leg_ab.transit_hours + 0.01)
+
+    (result,) = handle_weather_update(reg, g, _calm, {"u": "B", "v": "C"}, now)
+
+    old_tail = old_profile.legs[1:]  # A->B is already sailed; B->C, C->D remain
+    assert result.old_remaining_fuel_tonnes == pytest.approx(sum(l.fuel_tonnes for l in old_tail))
+    assert result.old_remaining_transit_hours == pytest.approx(sum(l.transit_hours for l in old_tail))
+    # The remaining-legs baseline must be strictly smaller than the whole
+    # profile (a leg was sailed) — the exact gap that made the naive
+    # old-vs-new comparison misleading.
+    assert result.old_remaining_fuel_tonnes < result.old_fuel_tonnes
+    assert result.old_remaining_transit_hours < result.old_transit_hours
+    # With unchanged calm weather the re-solve of the same legs should land
+    # close to the old plan for those legs — not 30%+ "cheaper".
+    assert result.new_fuel_tonnes == pytest.approx(result.old_remaining_fuel_tonnes, rel=0.05)
+
+
 def test_handle_weather_update_reoptimizes_multiple_affected_voyages():
     g = _three_leg_graph(100.0)
     floor_leg_hours = 100.0 / HI

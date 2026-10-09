@@ -152,6 +152,12 @@ def main() -> None:
         "group.id": CONSUMER_GROUP_ID,
         "auto.offset.reset": "latest",
         "enable.auto.commit": True,
+        # Handling ONE weather event does a real CMEMS fetch (~1 min) plus a
+        # bounded re-solve per affected voyage (up to ~3 min each), so the
+        # default 5-minute poll limit was exceeded on the first real run
+        # (_MAX_POLL_EXCEEDED, consumer dropped from its group). 30 minutes
+        # leaves room for several voyages being reoptimized in one event.
+        "max.poll.interval.ms": 1800000,
     })
     consumer.subscribe([TOPIC_VOYAGE_EVENTS, TOPIC_WEATHER_UPDATES])
 
@@ -189,9 +195,12 @@ def main() -> None:
                 results = handle_weather_update(registry, digraph, weather_lookup, payload, now)
 
                 for result in results:
-                    print(f"   Reoptimized {result.voyage_id!r}: "
-                          f"fuel {result.old_fuel_tonnes:.1f} -> {result.new_fuel_tonnes:.1f}t, "
-                          f"transit {result.old_transit_hours:.1f} -> "
+                    # Like-for-like: the SAME remaining legs, old plan vs new plan.
+                    # (old_fuel_tonnes is the whole voyage incl. legs already sailed.)
+                    print(f"   Reoptimized {result.voyage_id!r} (remaining legs only): "
+                          f"fuel {result.old_remaining_fuel_tonnes:.1f} -> "
+                          f"{result.new_fuel_tonnes:.1f}t, "
+                          f"transit {result.old_remaining_transit_hours:.1f} -> "
                           f"{result.new_transit_hours:.1f}h")
                     producer.produce(
                         TOPIC_REOPTIMIZATION_RESULTS,

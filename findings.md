@@ -1333,3 +1333,54 @@ revisions for a fixed past window are far rarer than for a live near-term
 window, so a demo may see few or no real weather-update events without either
 a longer observation period or (a real option, not implemented) shifting the
 polled window to something closer to "now" specifically to see live revisions.
+
+## Phase 6 — first real run on the user's machine: what it caught
+
+Run against the real Kafka broker and live CMEMS on 2026-10-09/10. The pipeline
+worked end to end (departure published, consumer registered it, an event
+triggered a real CMEMS re-fetch and a bounded re-solve, a result was published),
+and the run caught four real problems — three in my code or config, one a
+misleading number. None were visible from the sandbox that wrote the code.
+
+1. **Kafka had never started (Phase 0 config bug).** `CLUSTER_ID:
+   navi-opt-kraft-cluster-1` in `docker-compose.yml` is not a valid KRaft cluster
+   ID (must be a 22-character base64 UUID; that string decodes to 18 bytes), so
+   the broker crash-looped from the day the stack was created. It went unnoticed
+   because nothing had exercised Kafka until Phase 6, and `docker compose ps`
+   showing a container as "Up" between restarts is not the same as the broker
+   serving requests. Fixed with a valid ID (`MkU3OEVBNTcwNTJENDM2Qk`); no data
+   was lost because the volume had never been initialised. Lesson: a service
+   with no healthcheck being "up" is not evidence it works.
+2. **`depart_demo_voyage.py` had an unbounded solve.** Every other solve on this
+   corridor is capped (Phase 4 measured 217s to 32+ minutes uncapped), but the
+   departure script's first solve was not, and ran for 10+ minutes before being
+   stopped. Now uses the reoptimizer's budget (`maxiter=60`, `max_seconds=180`).
+   The capped result misses its own deadline slightly (344.2h vs 342.9h): an
+   unproven-optimal timed-out iterate, still a real, usable profile, published
+   as such.
+3. **`_MAX_POLL_EXCEEDED`.** Handling one weather event (about a minute of CMEMS
+   re-fetch plus up to 180s of solve per affected voyage) exceeds Kafka's default
+   5-minute `max.poll.interval.ms`, which dropped the consumer from its group
+   right after it finished the work. Raised to 30 minutes in the consumer config.
+4. **The printed before/after was not like-for-like.** The console showed
+   `fuel 369.7 -> 235.5t, transit 344.2 -> 217.0h` for a voyage that was simply
+   ~37% sailed — the old figures were the whole voyage, the new ones only the
+   remaining 240 of 386 legs. That reads as a 36% saving and is nothing of the
+   kind. `ReoptimizationResultEvent` now carries `old_remaining_fuel_tonnes` /
+   `old_remaining_transit_hours` (the old profile's matching tail), the
+   console prints those against the new figures, and a regression test pins it.
+   The whole-profile `old_*` fields stay for the record. No claim about savings
+   should ever be made from the whole-profile fields.
+
+**What the injected-event run does and does not show.** CMEMS's fixed June 2024
+window did not revise, so the weather event was a labelled test injection
+(`scripts/inject_weather_event.py`, event carries `"injected": true`). The
+consumer re-fetches real weather regardless (event-as-trigger), so an injected
+event proves the plumbing — event, affected-voyage lookup, bounded re-solve,
+commit, result published — and NOT that the optimizer responds to a storm.
+Demonstrating a genuine response would need a weather lookup that really
+differs from the one the voyage was planned against; not built.
+
+Not yet checked: that the consumer rejoins and keeps working after the
+`_MAX_POLL_EXCEEDED` drop (the fix removes the cause; recovery behaviour itself
+was not observed), and `run_weather_producer.py` publishing a genuine event.

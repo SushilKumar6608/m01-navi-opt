@@ -41,16 +41,16 @@ class ReoptimizationResultEvent:
     special tooling needed, same reasoning as `serialization.py`'s choice
     of plain JSON over a schema-registry format).
 
-    `old_*` vs `new_*` are NOT always a strictly apples-to-apples
-    before/after of the same remaining distance: `old_fuel_tonnes`/
-    `old_transit_hours` describe whatever was committed as of the voyage's
-    LAST commit (its previous departure or reoptimization), which may
-    cover a longer remaining path than `new_*` does if real time — and so
-    real legs — passed between that commit and this reoptimization. Close
-    together in time (the common case: a weather event firing shortly
-    after departure or a prior reoptimization) they're a meaningful
-    before/after; documented here so that isn't silently assumed to
-    always hold."""
+    `old_fuel_tonnes`/`old_transit_hours` describe the WHOLE previously
+    committed profile, which covers legs the voyage has already sailed;
+    `new_*` cover only the legs still ahead. They are NOT comparable —
+    the first real run showed "369.7 -> 235.5t" for a voyage that was
+    simply 37% done, which reads like a 36% saving and is nothing of the
+    kind. The like-for-like comparison is `old_remaining_*` (the same
+    remaining legs of the OLD profile, i.e. what the voyage was going to
+    burn/take from here on before this reoptimization) against `new_*`;
+    use those for any before/after claim. The whole-profile `old_*` fields
+    are kept for the record, not for comparison."""
 
     voyage_id: str
     trigger_u: str
@@ -61,6 +61,8 @@ class ReoptimizationResultEvent:
     new_transit_hours: float
     reoptimized_at: str
     committed_profile: Dict[str, Any]
+    old_remaining_fuel_tonnes: float = 0.0
+    old_remaining_transit_hours: float = 0.0
 
 
 def handle_voyage_departed(registry: VoyageRegistry, payload: Dict[str, Any]) -> Voyage:
@@ -141,6 +143,13 @@ def handle_weather_update(
             log.info("Voyage %s already arrived by %s — skipping", voyage_id, now)
             continue
 
+        # The new profile covers a suffix of the old one (see
+        # reoptimizer.py), so the old profile's matching tail is exactly
+        # the legs the voyage was going to sail from here on.
+        old_tail = old_profile.legs[len(old_profile.legs) - len(new_profile.legs):]
+        old_remaining_fuel = sum(leg.fuel_tonnes for leg in old_tail)
+        old_remaining_hours = sum(leg.transit_hours for leg in old_tail)
+
         registry.commit(voyage_id, new_profile)
         results.append(ReoptimizationResultEvent(
             voyage_id=voyage_id, trigger_u=u, trigger_v=v,
@@ -150,12 +159,14 @@ def handle_weather_update(
             new_transit_hours=new_profile.total_transit_hours,
             reoptimized_at=now.isoformat(),
             committed_profile=speed_profile_result_to_dict(new_profile),
+            old_remaining_fuel_tonnes=old_remaining_fuel,
+            old_remaining_transit_hours=old_remaining_hours,
         ))
         log.info(
-            "Reoptimized voyage %s after weather change on %s->%s: "
+            "Reoptimized voyage %s after weather change on %s->%s: remaining legs "
             "fuel %.1f -> %.1ft, transit %.1f -> %.1fh",
-            voyage_id, u, v, old_profile.total_fuel_tonnes, new_profile.total_fuel_tonnes,
-            old_profile.total_transit_hours, new_profile.total_transit_hours,
+            voyage_id, u, v, old_remaining_fuel, new_profile.total_fuel_tonnes,
+            old_remaining_hours, new_profile.total_transit_hours,
         )
 
     return results
