@@ -22,7 +22,7 @@ This split, and every other modeling assumption, is documented plainly in
 
 ## Status
 
-Through Phase 6 (Kafka event-driven reoptimization: a voyage departs, real CMEMS
+Through Phase 7a (Streamlit dashboard) and Phase 6 (Kafka event-driven reoptimization: a voyage departs, real CMEMS
 weather is polled and diffed against the previous poll, and a meaningful forecast
 change on an edge still ahead of a tracked voyage triggers a real, bounded
 re-solve of that voyage's remaining legs) — see `findings.md` for the running log
@@ -152,3 +152,19 @@ to `reoptimization-results`. See `findings.md`'s Phase 6 entry for the full
 design (the three-clock demo-time model, the event-as-trigger-not-ground-truth
 pattern, and the in-memory-registry/real-CMEMS-polling scope decisions) and what
 hasn't yet been verified against a real broker.
+
+## Running the dashboard (Phase 7a)
+
+```
+streamlit run src/navi_opt/dashboard/app.py
+```
+
+Two tabs: **Pareto trade-offs** (reads `data/processed/pareto_frontier*.csv`,
+written by `scripts/run_pareto_sweep.py`) and **Live voyages** (snapshot-reads the
+three Kafka topics, default `localhost:9092`; change it in the sidebar or with
+`NAVI_KAFKA`). `NAVI_DATA_DIR` overrides the data directory. The route map needs
+the cached ocean graph (`scripts/build_real_ocean_graph.py`) and loads its
+basemap from Plotly's CDN, so it needs internet access in the browser. Voyage
+positions come from the demo clock, not vessel tracking; the page says so.
+Tests: `tests/test_dashboard_*.py` (the Kafka reader itself is not unit-tested —
+it needs a broker).

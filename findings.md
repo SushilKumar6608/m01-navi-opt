@@ -1384,3 +1384,43 @@ differs from the one the voyage was planned against; not built.
 Not yet checked: that the consumer rejoins and keeps working after the
 `_MAX_POLL_EXCEEDED` drop (the fix removes the cause; recovery behaviour itself
 was not observed), and `run_weather_producer.py` publishing a genuine event.
+
+
+## Phase 7a — Streamlit dashboard
+
+**What it is.** `src/navi_opt/dashboard/`: `data.py` (pure, tested data layer),
+`charts.py` (Plotly figure builders, tested), `kafka_reader.py` (thin broker glue,
+not unit-tested), `app.py` (layout). No FastAPI layer yet; the app reads the
+sweep CSV and Kafka topics directly.
+
+**Design decisions that matter.**
+1. *Like-for-like only.* The reoptimization panel compares the remaining legs of
+   the previous plan with the new plan, never whole-voyage totals (the Phase 6
+   console bug). `compare_remaining()` derives the baseline from the matching tail
+   of the previous profile and refuses (ValueError) if the legs don't line up. It
+   does not trust the event's `old_remaining_*` fields, so results published
+   before those existed still display correctly.
+2. *Honest data labelling.* The injected-event case is flagged in the UI. The
+   demo-clock note and an "About the data" box state what is real (coastlines,
+   CMEMS weather), synthetic (fuel curves, deadline) and simulated (position).
+3. *Missing is not zero.* An older sweep CSV without the severe-weather column
+   yields NaN (omitted from hover and table), never 0.0. Solves that hit their
+   iteration/time cap are flagged as unproven-optimal.
+4. *Colour.* Per the dataviz method: three categorical slots in fixed order, extra
+   corridors fold into gray; frontier vs dominated is encoded by shape (diamond /
+   circle) as well as opacity; colour follows the corridor, not its rank, so
+   hiding dominated points does not repaint the rest (`corridor_order`). Plan
+   comparison uses gray for the original and one accent hue for the current plan.
+   Speed-plan y-axis is kept at least ~2 kn tall so a 0.3 kn change does not look
+   dramatic.
+
+**Verified (in a cloud sandbox, synthetic data).** Unit tests for the data layer
+and charts, `AppTest` smoke tests (voyage present, Kafka unreachable, no voyages,
+missing CSV/graph) with the Kafka reader faked, and screenshots of the Pareto tab,
+live-voyage KPIs, speed plan and history table in headless Chromium (light mode).
+
+**NOT verified.** (a) `kafka_reader.read_topic` against a real broker. (b) The
+route map's appearance: its basemap loads from a CDN the sandbox could not reach,
+so it rendered blank there. (c) Dark mode visually (palettes are defined and
+unit-checked for shape, not eyeballed). (d) The real sweep CSV and the 386-leg
+real graph: everything above used a 24-leg synthetic corridor.
