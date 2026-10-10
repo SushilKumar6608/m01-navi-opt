@@ -185,7 +185,7 @@ def pareto_scatter(
 def corridor_map(
     lats: Sequence[float], lons: Sequence[float], current_index: int, mode: str = "light",
     trigger_edge: Optional[Tuple[Tuple[float, float], Tuple[float, float]]] = None,
-    height: int = 460,
+    height: int = 520,
 ) -> go.Figure:
     """The voyage's route: sailed part (muted), remaining part (accent), the
     simulated current position, and — if given — the edge a weather event
@@ -235,11 +235,25 @@ def corridor_map(
         hovertemplate="Simulated position<extra></extra>",
     ))
 
+    # Explicit padded ranges instead of `fitbounds`: the latter gave an offset,
+    # partly empty frame in a wide Streamlit container.
+    pad_lon = max((max(lons) - min(lons)) * 0.08, 2.0)
+    pad_lat = max((max(lats) - min(lats)) * 0.15, 2.0)
+    lon_lo, lon_hi = min(lons) - pad_lon, max(lons) + pad_lon
+    lat_lo, lat_hi = min(lats) - pad_lat, max(lats) + pad_lat
+    # Plotly keeps the geo frame's aspect ratio fixed, so a route that is much
+    # taller than wide-screen proportions leaves empty bands at the sides. Widen
+    # the longitude span (centred) to roughly a wide-screen width:height ratio (narrower windows get slack above/below instead, which is harmless).
+    target_ratio = 4.2
+    need = (lat_hi - lat_lo) * target_ratio
+    if lon_hi - lon_lo < need:
+        mid = (lon_lo + lon_hi) / 2
+        lon_lo, lon_hi = mid - need / 2, mid + need / 2
     fig.update_geos(
         projection_type="equirectangular", showland=True, landcolor=p["land"],
         showocean=True, oceancolor=p["surface"], showcountries=False,
         coastlinecolor=p["axis"], coastlinewidth=1, showframe=False, bgcolor=p["surface"],
-        fitbounds="locations",
+        lonaxis=dict(range=[lon_lo, lon_hi]), lataxis=dict(range=[lat_lo, lat_hi]),
     )
     _style(fig, mode, height)
     fig.update_layout(margin=dict(l=0, r=0, t=40, b=0))
@@ -303,7 +317,7 @@ def speed_profile_chart(
     fig.update_xaxes(range=[0, x_max])
     if elapsed_hours > x_max:
         fig.add_annotation(text="Voyage complete (simulated clock is past the plan)", xref="paper", yref="paper",
-                           x=1, y=1.02, xanchor="right", yanchor="bottom", showarrow=False,
+                           x=0, y=1.0, xanchor="left", yanchor="bottom", showarrow=False,
                            font=dict(color=p["ink2"], size=11))
     _axes(fig, mode, "Voyage time (hours)", "Speed (knots)")
     # Keep the y-axis at least ~2 knots tall: auto-zoom would stretch a 0.3 kn
