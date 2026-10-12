@@ -22,7 +22,7 @@ This split, and every other modeling assumption, is documented plainly in
 
 ## Status
 
-Through Phase 7a (Streamlit dashboard) and Phase 6 (Kafka event-driven reoptimization: a voyage departs, real CMEMS
+Through Phase 7 (7a Streamlit dashboard, 7b read-only FastAPI) and Phase 6 (Kafka event-driven reoptimization: a voyage departs, real CMEMS
 weather is polled and diffed against the previous poll, and a meaningful forecast
 change on an edge still ahead of a tracked voyage triggers a real, bounded
 re-solve of that voyage's remaining legs) — see `findings.md` for the running log
@@ -168,3 +168,19 @@ basemap from Plotly's CDN, so it needs internet access in the browser. Voyage
 positions come from the demo clock, not vessel tracking; the page says so.
 Tests: `tests/test_dashboard_*.py` (the Kafka reader itself is not unit-tested —
 it needs a broker).
+
+## Running the API (Phase 7b)
+
+```
+uvicorn navi_opt.api.app:app --port 8000
+```
+
+Interactive docs at `http://localhost:8000/docs`. Read-only: it serves the Pareto
+sweep (`/frontier`) and snapshot-reads the Kafka topics for live state
+(`/voyages`, `/voyages/{id}`, `/voyages/{id}/profile`, `/voyages/{id}/route`,
+`/weather-events`); `/health` doesn't touch Kafka. Same `NAVI_DATA_DIR` /
+`NAVI_KAFKA` variables as the dashboard. It reuses the dashboard's data layer, so
+the reoptimization comparison is the same like-for-like one (`basis:
+"remaining_legs"`), injected test events are labelled, and positions are flagged
+`positions_simulated`. If Kafka is unreachable the endpoints return 503, not an
+empty list. Tests: `tests/test_api.py` (fake broker; `httpx` required).

@@ -25,6 +25,10 @@ TOPIC_VOYAGE_EVENTS = "voyage-events"
 TOPIC_WEATHER_UPDATES = "weather-updates"
 TOPIC_REOPTIMIZATION_RESULTS = "reoptimization-results"
 
+#: Prefix of the note returned when the broker can't be reached; the API uses it
+#: to tell "Kafka is down" (503) from "nothing published yet" (empty list).
+UNREACHABLE_PREFIX = "Cannot reach Kafka"
+
 #: Hard stop so a dashboard refresh can never hang on a slow/odd broker.
 DEFAULT_TIMEOUT_SECONDS = 15.0
 DEFAULT_MAX_MESSAGES = 50_000
@@ -62,7 +66,7 @@ def read_topic(
         try:
             metadata = consumer.list_topics(topic, timeout=timeout_seconds)
         except Exception as exc:
-            return [], f"Cannot reach Kafka at {bootstrap_servers}: {exc}"
+            return [], f"{UNREACHABLE_PREFIX} at {bootstrap_servers}: {exc}"
 
         topic_meta = metadata.topics.get(topic)
         if topic_meta is None or topic_meta.error is not None or not topic_meta.partitions:

@@ -24,6 +24,7 @@ dependencies:
       - ortools
       - pyomo
       - fastapi
+      - httpx            # fastapi.testclient (API tests)
       - uvicorn[standard]
       - pydantic
       - streamlit

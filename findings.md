@@ -1424,3 +1424,49 @@ route map's appearance: its basemap loads from a CDN the sandbox could not reach
 so it rendered blank there. (c) Dark mode visually (palettes are defined and
 unit-checked for shape, not eyeballed). (d) The real sweep CSV and the 386-leg
 real graph: everything above used a 24-leg synthetic corridor.
+
+
+## Phase 7b — read-only FastAPI layer
+
+**What it is.** `src/navi_opt/api/`: `schemas.py` (response models), `service.py`
+(conversions + a TTL cache in front of the Kafka reader, pure/testable), `app.py`
+(`create_app()` factory + module-level `app`). Endpoints: `/health`, `/frontier`,
+`/voyages`, `/voyages/{id}`, `/voyages/{id}/profile`, `/voyages/{id}/route`,
+`/weather-events`. Read-only by design: no publishing, departing or
+reoptimizing — an HTTP endpoint that can start 3-minute solves is a different
+(and riskier) product than a viewer.
+
+**Decisions.**
+1. *One source of truth.* All logic comes from `dashboard/data.py`, so the API
+   and the dashboard cannot disagree; the like-for-like comparison is labelled
+   `basis: "remaining_legs"` in the payload.
+2. *Honesty travels with the data.* `injected`, `positions_simulated`,
+   `solved_to_optimum`, and the demo-clock note are fields, not UI-only text. A
+   missing severe-weather column is `null`, never 0.
+3. *Failure is distinct from empty.* Kafka unreachable -> 503 (a
+   `UNREACHABLE_PREFIX` constant shared with the reader); no voyages yet -> `[]`;
+   unknown voyage -> 404; missing sweep/graph -> 404/503 with the script to run;
+   mismatched graph -> 409; `file=` rejects path traversal.
+4. *Dependencies injected.* `create_app(read_topic=..., graph_loader=..., now=...)`
+   means the 20 API tests run with no broker, graph build or CMEMS.
+5. *Bounded waits.* The API's Kafka reads time out at 8 s (dashboard: 15 s) and
+   are cached for 5 s so a burst of requests costs one broker read.
+
+**First real-data check caught a design flaw.** `/voyages/{id}` initially exposed
+`current_total_fuel_tonnes` (235.5 t, remaining 240 legs only) beside
+`original_total_fuel_tonnes` (369.7 t, whole voyage) — the same misleading
+"36% saving" as the Phase 6 console. Replaced with `latest_plan_*` fields plus
+`latest_plan_is_partial`, and a regression test; the like-for-like figure stays in
+`steps[].comparison` (+3.5 t, -2.2 h on this voyage).
+
+**Verified (cloud sandbox, synthetic data).** 21 TestClient tests; the app run as
+a real uvicorn server and queried over HTTP (voyage list/detail, `/docs`,
+`/openapi.json`); the real module-level `app` with no broker returns a clean 503.
+
+**Verified on the real machine (Oct 12).** All endpoints against the real broker, the real 386-leg graph
+and the real sweep CSV (voyage list/detail, route, frontier, weather events).
+
+**NOT verified.** Behaviour
+under concurrent clients beyond the 5 s cache; no authentication (it is a
+localhost demo API, not for exposure). `datetime.utcnow()` is used (as in the
+dashboard) and is deprecated in newer Pythons.
